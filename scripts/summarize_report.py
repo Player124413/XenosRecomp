@@ -91,6 +91,12 @@ def main():
     print("| Recompiled | {} |".format(succeeded))
     print("| Failed | {} |".format(failed))
     print("| With warnings | {} |".format(report.get("shadersWithWarnings", 0)))
+
+    compressed = report.get("decompressedArchives")
+
+    if compressed:
+        print("| Xbox 360 compressed files decoded | {} |".format(compressed))
+
     print()
 
     if failed == 0:

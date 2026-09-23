@@ -6,6 +6,10 @@ game, which makes it possible to test the recompiler without shipping any game d
 They are deliberately built around the control flow constructs that are easy to get
 wrong, such as conditional jumps on boolean constant registers.
 
+The generator also builds Xbox 360 compressed archives (the format of the "shader.ar.00"
+and "shader.ar.01" files of a game), so that the decompression done by the recompiler is
+tested as well.
+
 Usage: make_test_shaders.py <output directory>
 """
 
@@ -120,6 +124,72 @@ def pack_instructions(instructions):
         data += struct.pack(">III", dword0, dword1, dword2)
 
     return bytes(data)
+
+
+XCOMPRESS_SIGNATURE = 0x0FF512EE
+
+
+class LzxBitWriter:
+    """Writes bits the way LZX stores them: 16 bit little endian words, MSB first."""
+
+    def __init__(self):
+        self.bits = []
+
+    def add(self, value, count):
+        for i in range(count - 1, -1, -1):
+            self.bits.append((value >> i) & 1)
+
+    def finish(self):
+        while len(self.bits) % 16:
+            self.bits.append(0)
+
+        data = bytearray()
+        for offset in range(0, len(self.bits), 16):
+            word = 0
+            for bit in self.bits[offset:offset + 16]:
+                word = (word << 1) | bit
+            data += struct.pack("<H", word)
+
+        return bytes(data)
+
+
+def lzx_stream(data):
+    """Builds an LZX stream holding the data in a single uncompressed block."""
+    writer = LzxBitWriter()
+    writer.add(0, 1)                  # no intel filesize, shaders are not executables
+    writer.add(3, 3)                  # block type 3 is an uncompressed block
+    writer.add(len(data) >> 8, 16)    # block length, high bits first
+    writer.add(len(data) & 0xFF, 8)
+    stream = writer.finish()          # the rest of the current word is padding
+    stream += struct.pack("<III", 1, 1, 1)    # stored R0/R1/R2 values
+    stream += data
+
+    if len(data) % 2:
+        stream += b"\0"
+
+    return stream
+
+
+def xcompress_container(data, window_size=0x10000, partition_size=0x80000, uncompressed_block_size=None):
+    """Builds an Xbox 360 compressed file holding the data in a single block."""
+    payload = struct.pack(">H", len(lzx_stream(data))) + lzx_stream(data)
+    uncompressed_block_size = uncompressed_block_size or len(data)
+
+    header = struct.pack(">IIIIIIIIIIII",
+        XCOMPRESS_SIGNATURE,           # identifier
+        0x01030000,                    # version 1.3
+        0,                             # reserved
+        0,                             # context flags
+        window_size,                   # window size
+        partition_size,                # compression partition size
+        0,                             # uncompressed size, high
+        len(data),                     # uncompressed size, low
+        0,                             # compressed size, high
+        len(payload) + 4,              # compressed size, low
+        uncompressed_block_size,       # uncompressed block size
+        len(payload))                  # compressed block size, maximum
+
+    return header + struct.pack(">I", len(payload)) + payload
 
 
 class ConstantTableBuilder:
@@ -289,9 +359,15 @@ def make_test_shaders(output_directory):
         exec_instruction(address=0, count=0, sequence=0, opcode=OPCODE_EXEC_END),
     ]
 
-    write("ps_bool129.bin",
-          build_shader_container(True, table, pack_instructions(instructions), outputs=1),
+    psBool129 = build_shader_container(True, table, pack_instructions(instructions), outputs=1)
+
+    write("ps_bool129.bin", psBool129,
           dict(stage="ps", expected_bit=17, expected_register=129))
+
+    # The same shader inside an Xbox 360 compressed file, which is how the shaders of a game
+    # are stored on disk. It has to recompile into exactly the same shader.
+    write("xc_bool129.bin", xcompress_container(psBool129),
+          dict(stage="ps", expected_bit=17, expected_register=129, cache_alias="ps_bool129.bin"))
 
     #
     # Pixel shader that jumps on a boolean register that is not part of the constant
@@ -322,9 +398,10 @@ def make_test_shaders(output_directory):
         exec_instruction(address=0, count=0, sequence=0, opcode=OPCODE_EXEC_END),
     ]
 
-    write("vs_bool5.bin",
-          build_shader_container(False, table, pack_instructions(instructions), outputs=0,
-                                 vertex_elements=[vertex_element_value(0, DECL_USAGE_POSITION, 0)]),
+    vsBool5 = build_shader_container(False, table, pack_instructions(instructions), outputs=0,
+                                     vertex_elements=[vertex_element_value(0, DECL_USAGE_POSITION, 0)])
+
+    write("vs_bool5.bin", vsBool5,
           dict(stage="vs", expected_bit=5, expected_register=5))
 
     #
@@ -387,7 +464,56 @@ def make_test_shaders(output_directory):
     with open(os.path.join(output_directory, "expected.json"), "w") as f:
         json.dump(generated, f, indent=2)
 
+    write_archives(output_directory, psBool129, vsBool5)
+
     return generated
+
+
+def write_archives(output_directory, ps_shader, vs_shader):
+    """Writes the archive layouts that the recompiler has to unpack before it can recompile.
+
+    The parts of an archive are either compressed files of their own or the pieces of a single
+    compressed stream that was cut in half, and both layouts are stored here.
+    """
+    split_directory = os.path.join(output_directory, "xcompress-split")
+    joined_directory = os.path.join(output_directory, "xcompress-joined")
+    broken_directory = os.path.join(output_directory, "xcompress-broken")
+
+    for directory in (split_directory, joined_directory, broken_directory):
+        os.makedirs(directory, exist_ok=True)
+
+    # Every part is a compressed file of its own, one shader per part.
+    with open(os.path.join(split_directory, "shader.ar.00"), "wb") as f:
+        f.write(xcompress_container(ps_shader))
+
+    with open(os.path.join(split_directory, "shader.ar.01"), "wb") as f:
+        f.write(xcompress_container(vs_shader))
+
+    # A single compressed stream that was cut in half, so that only the first part still has
+    # the header of the container.
+    container = xcompress_container(ps_shader)
+    cut = len(container) * 2 // 3
+
+    with open(os.path.join(joined_directory, "shader.ar.00"), "wb") as f:
+        f.write(container[:cut])
+
+    with open(os.path.join(joined_directory, "shader.ar.01"), "wb") as f:
+        f.write(container[cut:])
+
+    # A valid compressed file next to one whose payload was overwritten, which has to be
+    # reported as an archive without shaders instead of taking the recompiler down.
+    with open(os.path.join(broken_directory, "good.ar.00"), "wb") as f:
+        f.write(xcompress_container(ps_shader))
+
+    # The size of the first block is made far larger than the file, which is what a cut off or
+    # corrupted download of an archive looks like.
+    broken = bytearray(xcompress_container(vs_shader))
+    broken[48:52] = (0x0FFFFFF0).to_bytes(4, "big")
+
+    with open(os.path.join(broken_directory, "broken.ar.00"), "wb") as f:
+        f.write(broken)
+
+    return dict(split=split_directory, joined=joined_directory, broken=broken_directory)
 
 
 def main():

@@ -48,6 +48,8 @@ Integer constants are unimplemented. If the target game requires them, you will 
 
 Vertex and pixel shader boolean constants each contain 16 elements. These are packed into a 32-bit integer and stored in the shared constants buffer, where the Nth bit represents the value of the Nth boolean register. The Xbox 360 GPU supposedly supports up to 128 boolean registers, which may require increasing the size of the `g_Booleans` data type for other games.
 
+Boolean constants are read as a test of the packed bit of the register, which means that conditional jumps on registers that are not part of the reflection data of a shader still resolve to the right bit instead of referring to an undeclared identifier. Pixel shader registers (`b128` and up) occupy the upper half of the packed value, and registers outside of the 32 bits that fit into `g_Booleans` are folded into a constant condition and reported as a warning, because the shared constants buffer only carries 8 booleans per stage as it is.
+
 All constant buffers are implemented as root constant buffers in D3D12, making them easy to upload to the GPU using a linear allocator. In Vulkan, the GPU virtual addresses of constant buffers are passed as push constants. Constants are accessed via preprocessor macros that load values from the GPU virtual addresses using `vk::RawBufferLoad`. These macros ensure the shader function body remains the same for both DXIL and SPIR-V.
 
 Out-of-bounds dynamic constant accesses should return 0. However, since root constant buffers in D3D12 and raw buffer loads in Vulkan do not enforce this behavior, the shader developer must handle it. To solve this, each dynamic index access is clamped to the valid range, and out-of-bounds registers are forced to become 0.
@@ -113,6 +115,8 @@ XenosRecomp [input directory path] [output .cpp file path] [header file path]
 
 At runtime, shaders are mapped to their recompiled versions using a 64-bit XXH3 hash lookup. This scanning method is particularly useful for games that store embedded shaders within executables or uncompressed archive formats.
 
+Files that are compressed with the Xbox 360 file compression (`XMemCompress`, magic `0x0FF512EE`) are decompressed in memory before they are scanned, so the shader archives of a game can be passed to the recompiler as they are stored on the disc. The parts of an archive that was split into `shader_r.ar.00`, `shader_r.ar.01` and so on are joined again before they are scanned, no matter whether the split happened between two compressed files or in the middle of a compression stream. The LZX decoder comes from [libmspack](https://github.com/kyz/libmspack) and is built from the sources in `XenosRecomp/thirdparty/libmspack`.
+
 SPIR-V shaders are compressed using smol-v to improve zstd compression efficiency, while DXIL shaders are compressed as-is.
 
 ### Options
@@ -135,6 +139,8 @@ The report lists every shader that failed or produced a warning together with it
 
 The `Recompile Shaders` workflow recompiles a set of shaders on GitHub's runners. Open it from the `Actions` tab, press `Run workflow` and paste a link to an archive with the shader files (`.zip`, Google Drive, MediaFire or GitHub release links all work) before running it. Nested archives, such as the shader `.ar` file stored inside a zip, are extracted automatically.
 
+The archive may hold the game files in any form the recompiler understands: plain shader containers, compressed files (`.ar`, `.ar.00`, `.ar.01`), or a mix of both. Files that only hold the index of an archive, such as the `.arl` files next to the shader archives of a Sonic game, are unpacked as well and simply do not contain any shaders.
+
 The workflow builds the recompiler, runs the self-tests, recompiles every shader found in the archive and uploads these artifacts:
 
 * the shader cache (`shader_cache.cpp` by default) and the JSON report,
@@ -145,7 +151,7 @@ The job summary lists the number of recompiled and failed shaders, the failing s
 
 ### Self-Tests
 
-`tests/run_tests.py` builds a set of shader containers with `tests/make_test_shaders.py`, recompiles them with a built `XenosRecomp` and checks the results, including the packed boolean constant handling, the JSON report and the handling of corrupted shader containers:
+`tests/run_tests.py` builds a set of shader containers with `tests/make_test_shaders.py`, recompiles them with a built `XenosRecomp` and checks the results, including the packed boolean constant handling, the JSON report, the handling of corrupted shader containers and the unpacking of compressed shader archives:
 
 ```
 python3 tests/run_tests.py --tool <path to XenosRecomp> [--include <shader_common.h>]

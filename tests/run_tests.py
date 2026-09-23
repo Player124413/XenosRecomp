@@ -6,6 +6,9 @@ control flow constructs that are easy to break, most notably conditional jumps o
 boolean constant registers such as b128/b129, which used to be emitted as references to
 identifiers that were never declared.
 
+The generated Xbox 360 compressed archives are tested as well, because the shaders of a
+game are stored in them as "shader.ar.00" and "shader.ar.01" files.
+
 Usage:
     run_tests.py --tool <path to XenosRecomp> [--include <shader_common.h>] [--work-dir <dir>]
 
@@ -62,6 +65,7 @@ def run_tool(arguments, expect_success=True):
 def test_single_shaders(tool, include, work_directory, expected):
     """Recompiles every generated shader on its own and inspects the generated HLSL."""
     failures = 0
+    hlslByFile = {}
 
     for entry in expected:
         name = entry["file"]
@@ -75,6 +79,7 @@ def test_single_shaders(tool, include, work_directory, expected):
                 hlsl = f.read()
 
             code = strip_comments(hlsl)
+            hlslByFile[name] = hlsl
 
             match = BARE_BOOLEAN_REGISTER.search(code)
             check(match is None, "generated HLSL references the undeclared boolean register '{}'".format(
@@ -84,6 +89,14 @@ def test_single_shaders(tool, include, work_directory, expected):
                 bit = entry["expected_bit"]
                 check("(g_Booleans & (1u << {}))".format(bit) in code,
                       "expected a test of packed boolean bit {} in the generated HLSL".format(bit))
+
+            alias = entry.get("cache_alias")
+
+            if alias is not None:
+                check(alias in hlslByFile, "the shader '{}' was not recompiled before '{}'".format(alias, name))
+                check(hlsl == hlslByFile[alias],
+                      "'{}' should recompile into the same shader as '{}', which holds the same shader in an "
+                      "Xbox 360 compressed file".format(name, alias))
 
             if "out_of_range_register" in entry:
                 check("outside of the supported packed boolean range" in hlsl,
@@ -117,7 +130,9 @@ def test_shader_cache(tool, include, work_directory, expected):
             cache = f.read()
 
         check("g_shaderCacheEntries" in cache, "the shader cache does not contain any entries")
-        check("g_shaderCacheEntryCount = {}".format(len(expected)) in cache,
+        cacheEntries = len(set(entry.get("cache_alias", entry["file"]) for entry in expected))
+
+        check("g_shaderCacheEntryCount = {}".format(cacheEntries) in cache,
               "the shader cache does not contain every test shader")
         check("g_compressedDxilCache" in cache or "g_compressedSpirvCache" in cache,
               "the shader cache does not contain any compiled shader data")
@@ -127,8 +142,8 @@ def test_shader_cache(tool, include, work_directory, expected):
         with open(report_path, "r", encoding="utf-8") as f:
             report = json.load(f)
 
-        check(report["totalShaders"] == len(expected),
-              "the report counts {} shaders instead of {}".format(report["totalShaders"], len(expected)))
+        check(report["totalShaders"] == cacheEntries,
+              "the report counts {} shaders instead of {}".format(report["totalShaders"], cacheEntries))
         check(report["failedShaders"] == 0, "{} test shaders failed to recompile".format(report["failedShaders"]))
 
         warnings = [warning for shader in report["shaders"] for warning in shader["warnings"]]
@@ -179,10 +194,11 @@ def test_unresolvable_shaders(tool, include, work_directory):
 
 
 def test_corrupted_shaders(tool, include, work_directory):
-    """Checks that corrupted shader containers are reported instead of crashing the recompiler.
+    """Checks that corrupted shader containers and archives are reported instead of crashing.
 
-    Every offset stored in a container is read from untrusted data, so a mutation of a
-    valid shader is used to make sure that out of bounds offsets are rejected cleanly.
+    Every offset stored in a container is read from untrusted data, so mutations of a valid
+    shader are used to make sure that out of bounds offsets are rejected cleanly. Half of the
+    files are mutations of an Xbox 360 compressed archive, which exercises the decompressor.
     """
     failures = 0
     corrupted_directory = os.path.join(work_directory, "corrupted")
@@ -191,13 +207,19 @@ def test_corrupted_shaders(tool, include, work_directory):
     random.seed(0x5EED)
 
     with open(os.path.join(work_directory, "ps_bool129.bin"), "rb") as f:
-        source = f.read()
+        sources = [f.read()]
 
-    for index in range(24):
+    with open(os.path.join(work_directory, "xc_bool129.bin"), "rb") as f:
+        sources.append(f.read())
+
+    for index in range(32):
+        source = sources[index % 2]
         data = bytearray(source)
 
         for _ in range(random.randint(1, 40)):
-            data[random.randrange(len(data))] = random.randrange(256)
+            # The magic value of a compressed file is left alone, so that the decompressor
+            # is the code that has to deal with the corrupted data.
+            data[random.randrange(4 if source is sources[1] else 0, len(data))] = random.randrange(256)
 
         # Container offsets, the shader offset and the constant table offset are hit as well.
         if index % 4 == 0:
@@ -234,6 +256,57 @@ def test_corrupted_shaders(tool, include, work_directory):
     return failures
 
 
+def test_archives(tool, include, work_directory, archives):
+    """Checks that the Xbox 360 compressed archives of a game are unpacked before recompiling.
+
+    The shaders of a game are stored in "shader.ar.00" and "shader.ar.01" files, so the
+    recompiler has to decompress them and join the parts of an archive that was split in the
+    middle of a compression stream.
+    """
+    failures = 0
+
+    cases = (
+        ("split", "archive that was split into two compressed files", 2),
+        ("joined", "archive that was split in the middle of the stream", 1),
+        ("broken", "archive with a corrupted part", 1),
+    )
+
+    for key, description, expectedShaders in cases:
+        directory = archives[key]
+        cache_path = os.path.join(directory, "out", "shader_cache.cpp")
+        report_path = os.path.join(directory, "out", "report.json")
+        log_path = os.path.join(directory, "out", "log.txt")
+
+        try:
+            code, output = run_tool([tool, directory, cache_path, include, "--report", report_path])
+
+            with open(log_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(output)
+
+            with open(report_path, "r", encoding="utf-8") as f:
+                report = json.load(f)
+
+            check(report["failedShaders"] == 0,
+                  "{} shader(s) of the {} failed to recompile".format(report["failedShaders"], description))
+            check(report["totalShaders"] == expectedShaders,
+                  "the {} should hold {} shader(s), but {} were recompiled".format(
+                      description, expectedShaders, report["totalShaders"]))
+            check(report["decompressedArchives"] > 0,
+                  "no Xbox 360 compressed archive was decoded for the {}".format(description))
+
+            if key == "broken":
+                check("could not be decoded" in output,
+                      "the corrupted part of the {} was not reported".format(description))
+                check(code == 0, "the {} made the recompiler exit with {}".format(description, code))
+
+            print("  ok   {}".format(description))
+        except (TestFailure, OSError, ValueError) as error:
+            failures += 1
+            print("  FAIL {}: {}".format(description, error))
+
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tool", required=True, help="Path to the XenosRecomp executable")
@@ -255,6 +328,9 @@ def main():
     failures += test_shader_cache(args.tool, include, work_directory, expected)
     failures += test_unresolvable_shaders(args.tool, include, work_directory)
     failures += test_corrupted_shaders(args.tool, include, work_directory)
+    failures += test_archives(args.tool, include, work_directory, make_test_shaders.write_archives(
+        work_directory, open(os.path.join(work_directory, "ps_bool129.bin"), "rb").read(),
+        open(os.path.join(work_directory, "vs_bool5.bin"), "rb").read()))
 
     if args.work_dir is None:
         shutil.rmtree(work_directory, ignore_errors=True)

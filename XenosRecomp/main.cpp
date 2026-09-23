@@ -7,6 +7,7 @@
 #include "shader.h"
 #include "shader_recompiler.h"
 #include "dxc_compiler.h"
+#include "xcompress.h"
 
 #ifdef XENOS_RECOMP_AIR
 #include "air_compiler.h"
@@ -135,6 +136,71 @@ static std::string indentLines(const std::string_view text, const std::string_vi
         result.append(trimmedLine);
         result.push_back('\n');
     });
+
+    return result;
+}
+
+// Calls the callback for every shader container found in a buffer. Games store their shaders
+// inside archives that can be scanned this way, because a container starts with a magic value.
+template<typename TCallback>
+static void forEachShaderContainer(const uint8_t* data, size_t size, const TCallback& callback)
+{
+    for (size_t i = 0; size > sizeof(ShaderContainer) && i < size - sizeof(ShaderContainer) - 1;)
+    {
+        auto shaderContainer = reinterpret_cast<const ShaderContainer*>(data + i);
+        const size_t dataSize = shaderContainer->virtualSize + shaderContainer->physicalSize;
+
+        if ((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 &&
+            dataSize <= (size - i) &&
+            shaderContainer->field1C == 0 &&
+            shaderContainer->field20 == 0)
+        {
+            callback(i, dataSize);
+            i += dataSize;
+        }
+        else
+        {
+            i += sizeof(uint32_t);
+        }
+    }
+}
+
+// Archives that are too large for a single file are stored as "name.ar.00", "name.ar.01" and so on,
+// with the part number at the end of the file name.
+struct ArchiveName
+{
+    std::string key;      // name of the whole archive, without the part number
+    uint32_t partIndex = 0;
+    bool isPart = false;  // false when the file name does not have a part number
+};
+
+static ArchiveName splitArchiveName(const std::filesystem::path& path)
+{
+    const std::string name = path.filename().string();
+    const size_t position = name.rfind(".ar");
+
+    ArchiveName result;
+
+    if (position == std::string::npos)
+    {
+        result.key = path.string();
+        return result;
+    }
+
+    const std::string suffix = name.substr(position + 3);
+
+    if (!suffix.empty() &&
+        (suffix.size() != 3 || suffix[0] != '.' || !isdigit(uint8_t(suffix[1])) || !isdigit(uint8_t(suffix[2]))))
+    {
+        result.key = path.string();
+        return result;
+    }
+
+    result.key = (path.parent_path() / name.substr(0, position + 3)).string();
+    result.isPart = true;
+
+    if (!suffix.empty())
+        result.partIndex = uint32_t((suffix[1] - '0') * 10 + (suffix[2] - '0'));
 
     return result;
 }
@@ -543,7 +609,8 @@ static std::string jsonEscape(const std::string_view value)
 }
 
 static void writeReport(const Options& options, const std::vector<ShaderJob>& jobs, const std::vector<ShaderResult>& results,
-    uint32_t failedShaders, uint32_t shadersWithWarnings, const std::vector<std::string>& runWarnings)
+    uint32_t failedShaders, uint32_t shadersWithWarnings, const std::vector<std::string>& runWarnings,
+    uint32_t decompressedArchives)
 {
     if (options.report.empty())
         return;
@@ -557,6 +624,7 @@ static void writeReport(const Options& options, const std::vector<ShaderJob>& jo
     report.println("  \"successfulShaders\": {},", jobs.size() - failedShaders);
     report.println("  \"failedShaders\": {},", failedShaders);
     report.println("  \"shadersWithWarnings\": {},", shadersWithWarnings);
+    report.println("  \"decompressedArchives\": {},", decompressedArchives);
 
     report.print("  \"warnings\": [");
     for (size_t i = 0; i < runWarnings.size(); i++)
@@ -681,9 +749,87 @@ static void printFailures(const std::vector<ShaderJob>& jobs, const std::vector<
     }
 }
 
+// Decodes the parts of a shader archive. Depending on the game, the parts of a split archive are
+// either complete compressed files of their own or the pieces of a single compressed stream that
+// was cut in half, so both layouts are tried before the data is handed over as it is.
+static std::vector<uint8_t> decodeArchiveParts(const std::vector<std::vector<uint8_t>>& parts, std::string& status)
+{
+    std::vector<uint8_t> joined;
+
+    for (const auto& part : parts)
+        joined.insert(joined.end(), part.begin(), part.end());
+
+    bool allContainers = !parts.empty();
+    bool anyContainer = false;
+
+    for (const auto& part : parts)
+    {
+        const bool isContainer = XCompressContainer::isContainer(part.data(), part.size());
+        allContainers &= isContainer;
+        anyContainer |= isContainer;
+    }
+
+    // Every part is a compressed file of its own.
+    if (allContainers)
+    {
+        std::vector<uint8_t> result;
+        bool complete = true;
+        bool failed = false;
+
+        for (size_t i = 0; i < parts.size() && !failed; i++)
+        {
+            try
+            {
+                auto decoded = XCompressContainer::decompress(parts[i].data(), parts[i].size());
+                complete &= decoded.complete;
+                result.insert(result.end(), decoded.data.begin(), decoded.data.end());
+            }
+            catch (const std::exception& error)
+            {
+                failed = true;
+                status = error.what();
+            }
+        }
+
+        if (!failed)
+        {
+            status = complete
+                ? fmt::format("decompressed {} part(s) (Xbox 360 compression)", parts.size())
+                : fmt::format("decompressed {} part(s), the last one is incomplete", parts.size());
+            return result;
+        }
+    }
+
+    // The parts may be a single compressed stream that was cut in half.
+    if (XCompressContainer::isContainer(joined.data(), joined.size()))
+    {
+        try
+        {
+            auto decoded = XCompressContainer::decompress(joined.data(), joined.size());
+
+            if (decoded.complete)
+            {
+                status = "decompressed 1 part (Xbox 360 compression)";
+                return decoded.data;
+            }
+        }
+        catch (const std::exception&)
+        {
+            // Fall through to the plain data below.
+        }
+    }
+
+    // Nothing could be decoded. Hand the data over as it is, which covers both uncompressed
+    // archives and archives that use a compression the recompiler does not know.
+    if (status.empty() || status.find("decompressed") == 0)
+        status = anyContainer ? "the Xbox 360 compressed data could not be decoded" : "uncompressed data";
+
+    return joined;
+}
+
 static int recompileShaderCache(const Options& options, const std::string_view include)
 {
-    std::vector<std::unique_ptr<uint8_t[]>> files;
+    std::vector<std::vector<uint8_t>> files;
     std::map<XXH64_hash_t, RecompiledShader> shaders;
     std::vector<RecompiledShader*> shaderStorages;
     std::vector<ShaderJob> jobs;
@@ -700,6 +846,16 @@ static int recompileShaderCache(const Options& options, const std::string_view i
     std::map<XXH64_hash_t, std::string> shaderFilenames;
     std::filesystem::recursive_directory_iterator end;
 
+    // The parts of a split archive are collected first, so that they can be decoded together.
+    struct ArchivePart
+    {
+        std::filesystem::path path;
+        uint32_t index = 0;
+    };
+
+    std::map<std::string, std::vector<ArchivePart>> archives;
+    std::vector<std::string> archiveOrder;
+
     for (; iterator != end; iterator.increment(errorCode))
     {
         if (errorCode)
@@ -711,52 +867,92 @@ static int recompileShaderCache(const Options& options, const std::string_view i
         if (iterator->is_directory(errorCode))
             continue;
 
-        size_t fileSize = 0;
-        std::unique_ptr<uint8_t[]> fileData;
+        const auto archive = splitArchiveName(iterator->path());
 
-        try
+        if (archives.find(archive.key) == archives.end())
+            archiveOrder.emplace_back(archive.key);
+
+        archives[archive.key].push_back({ iterator->path(), archive.partIndex });
+    }
+
+    uint32_t decompressedArchives = 0;
+    uint32_t failedArchives = 0;
+
+    for (const auto& key : archiveOrder)
+    {
+        auto& parts = archives[key];
+
+        std::sort(parts.begin(), parts.end(), [](const ArchivePart& left, const ArchivePart& right)
         {
-            fileData = readAllBytes(iterator->path().string().c_str(), fileSize);
+            return left.index < right.index;
+        });
+
+        std::vector<std::vector<uint8_t>> partData;
+        bool readable = true;
+
+        for (const auto& part : parts)
+        {
+            try
+            {
+                size_t partSize = 0;
+                auto data = readAllBytes(part.path.string().c_str(), partSize);
+                partData.emplace_back(data.get(), data.get() + partSize);
+            }
+            catch (const std::exception& error)
+            {
+                logError(error.what());
+                readable = false;
+                break;
+            }
         }
-        catch (const std::exception& error)
-        {
-            logError(error.what());
+
+        if (!readable || partData.empty())
             continue;
-        }
+
+        std::string status;
+        std::vector<uint8_t> stream = decodeArchiveParts(partData, status);
+
+        if (stream.empty())
+            continue;
 
         bool foundAny = false;
 
-        for (size_t i = 0; fileSize > sizeof(ShaderContainer) && i < fileSize - sizeof(ShaderContainer) - 1;)
+        forEachShaderContainer(stream.data(), stream.size(), [&](size_t offset, size_t dataSize)
         {
-            auto shaderContainer = reinterpret_cast<const ShaderContainer*>(fileData.get() + i);
-            size_t dataSize = shaderContainer->virtualSize + shaderContainer->physicalSize;
+            auto shaderContainer = reinterpret_cast<const ShaderContainer*>(stream.data() + offset);
+            XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
+            auto shader = shaders.try_emplace(hash);
 
-            if ((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 &&
-                dataSize <= (fileSize - i) &&
-                shaderContainer->field1C == 0 &&
-                shaderContainer->field20 == 0)
+            if (shader.second)
             {
-                XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
-                auto shader = shaders.try_emplace(hash);
-                if (shader.second)
-                {
-                    shader.first->second.data = fileData.get() + i;
-                    shader.first->second.dataSize = dataSize;
-                    foundAny = true;
-                    shaderFilenames[hash] = iterator->path().string();
-                }
-
-                i += dataSize;
+                shader.first->second.data = stream.data() + offset;
+                shader.first->second.dataSize = dataSize;
+                foundAny = true;
+                shaderFilenames[hash] = parts.front().path.string();
             }
-            else
-            {
-                i += sizeof(uint32_t);
-            }
-        }
+        });
 
         if (foundAny)
-            files.emplace_back(std::move(fileData));
+        {
+            if (status.find("decompressed") == 0)
+                decompressedArchives++;
+
+            logLine("Found shaders in '{}' ({} bytes): {}", key, stream.size(), status);
+            files.emplace_back(std::move(stream));
+        }
+        else if (status.find("decompressed") == 0)
+        {
+            decompressedArchives++;
+        }
+        else if (parts.size() > 1 || XCompressContainer::isContainer(partData.front().data(), partData.front().size()))
+        {
+            failedArchives++;
+            logLine("No shaders found in '{}': {}", key, status);
+        }
     }
+
+    if (decompressedArchives != 0 || failedArchives != 0)
+        logLine("Decoded {} Xbox 360 compressed file(s), {} could not be decoded.", decompressedArchives, failedArchives);
 
     jobs.reserve(shaders.size());
     shaderStorages.reserve(shaders.size());
@@ -979,7 +1175,7 @@ static int recompileShaderCache(const Options& options, const std::string_view i
         logLine("warning: {}", runWarnings.back());
     }
 
-    writeReport(options, jobs, results, failedShaders, shadersWithWarnings, runWarnings);
+    writeReport(options, jobs, results, failedShaders, shadersWithWarnings, runWarnings, decompressedArchives);
 
     if (failedShaders != 0 && !options.allowFailures)
     {
@@ -1028,7 +1224,45 @@ int main(int argc, char** argv)
         ShaderRecompiler recompiler;
         size_t fileSize = 0;
         auto fileData = readAllBytes(options.input.c_str(), fileSize);
-        recompiler.recompile(fileData.get(), fileSize, include);
+
+        // Directories are scanned for shaders because the files of a game are archives that hold
+        // more than one of them, so a single file may contain several shaders as well.
+        std::vector<uint8_t> decompressed;
+        const uint8_t* data = fileData.get();
+        size_t dataSize = fileSize;
+
+        if (XCompressContainer::isContainer(fileData.get(), fileSize))
+        {
+            auto result = XCompressContainer::decompress(fileData.get(), fileSize);
+            decompressed = std::move(result.data);
+            data = decompressed.data();
+            dataSize = decompressed.size();
+
+            logLine("Decompressed '{}' from {} to {} bytes with Xbox 360 compression.",
+                options.input, fileSize, dataSize);
+        }
+
+        size_t shaderOffset = 0;
+        size_t shaderSize = 0;
+        uint32_t shaderCount = 0;
+
+        forEachShaderContainer(data, dataSize, [&](size_t offset, size_t size)
+        {
+            if (shaderCount++ == 0)
+            {
+                shaderOffset = offset;
+                shaderSize = size;
+            }
+        });
+
+        if (shaderCount == 0)
+            throw std::runtime_error(fmt::format("No shader was found in '{}'.", options.input));
+
+        if (shaderCount > 1)
+            logLine("'{}' holds {} shaders, only the first one is recompiled. Use the directory input to recompile all of them.",
+                options.input, shaderCount);
+
+        recompiler.recompile(data + shaderOffset, shaderSize, include);
         writeAllBytes(options.output.c_str(), recompiler.out.data(), recompiler.out.size());
         logLine("Wrote the recompiled shader to '{}'.", options.output);
 

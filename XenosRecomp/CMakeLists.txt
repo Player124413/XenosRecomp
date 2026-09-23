@@ -21,6 +21,14 @@ set(XENOS_RECOMP_EXTRA_DEFINES "" CACHE STRING
     "Additional compile definitions to pass to XenosRecomp (semicolon separated)")
 
 set(SMOLV_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/smol-v/source")
+set(LIBMSPACK_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/libmspack")
+
+# The LZX decoder of libmspack, which is used to decode the Xbox 360 compressed files the shaders
+# of a game are stored in. It is built as a separate target because the sources are C.
+add_library(libmspack STATIC
+    "${LIBMSPACK_SOURCE_DIR}/lzxd.c")
+
+target_include_directories(libmspack PUBLIC "${LIBMSPACK_SOURCE_DIR}")
 
 add_executable(XenosRecomp
     constant_table.h
@@ -32,7 +40,11 @@ add_executable(XenosRecomp
     shader_code.h
     shader_recompiler.cpp
     shader_recompiler.h
+    xcompress.cpp
+    xcompress.h
     "${SMOLV_SOURCE_DIR}/smolv.cpp")
+
+target_link_libraries(XenosRecomp PRIVATE libmspack)
 
 target_link_libraries(XenosRecomp PRIVATE
     Microsoft::DirectXShaderCompiler

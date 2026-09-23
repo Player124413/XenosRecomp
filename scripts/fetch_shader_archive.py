@@ -4,7 +4,8 @@
 The goal of this script is to make the "paste a link and recompile" workflow usable
 from GitHub Actions: it accepts the kind of links people actually share (direct file
 links, Google Drive, MediaFire, GitHub release assets, local paths), extracts archives
-including nested ones, and verifies that shader containers were actually found before
+including nested ones, and verifies that shader containers or Xbox 360 compressed
+archives were actually found before
 the recompiler is started.
 
 Usage:
@@ -33,6 +34,12 @@ import zipfile
 
 SHADER_CONTAINER_MAGIC = b"\x10\x2a\x11\x00"
 SHADER_CONTAINER_MAGIC_VERTEX = b"\x10\x2a\x11\x01"
+
+# Xbox 360 compressed files, which is what the shader archives of Sonic Unleashed and Sonic
+# Generations are ("shader.ar.00", "shader.ar.01", ...). The recompiler decompresses them by
+# itself, so an archive that only holds these is fine.
+XCOMPRESS_MAGIC = b"\x0f\xf5\x12\xee"
+XCOMPRESS_MAGIC_DELTA = b"\x0f\xf5\x12\xed"
 ARCHIVE_EXTENSIONS = (".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".tar.gz")
 NESTED_ARCHIVE_EXTENSIONS = (".zip", ".7z", ".rar", ".tar", ".gz", ".tgz")
 
@@ -243,11 +250,9 @@ def extract_nested_archives(directory, max_depth):
             extract_archive(path, target, keep=False)
 
 
-def count_shader_containers(directory):
-    """Counts shader containers by scanning for the container magic."""
-    count = 0
-    files_scanned = 0
-    bytes_scanned = 0
+def scan_for_shaders(directory):
+    """Scans the extracted files for shader containers and for Xbox 360 compressed archives."""
+    result = dict(containers=0, compressed_files=0, files=0, size=0)
 
     for root, _, files in os.walk(directory):
         for name in files:
@@ -258,13 +263,16 @@ def count_shader_containers(directory):
             except OSError:
                 continue
 
-            files_scanned += 1
-            bytes_scanned += len(data)
+            result["files"] += 1
+            result["size"] += len(data)
 
             for magic in (SHADER_CONTAINER_MAGIC, SHADER_CONTAINER_MAGIC_VERTEX):
-                count += data.count(magic)
+                result["containers"] += data.count(magic)
 
-    return count, files_scanned, bytes_scanned
+            if data[:4] in (XCOMPRESS_MAGIC, XCOMPRESS_MAGIC_DELTA):
+                result["compressed_files"] += 1
+
+    return result
 
 
 def fetch(url_or_path, output_directory, keep_archive=True, max_depth=2, verify=True):
@@ -299,16 +307,20 @@ def fetch(url_or_path, output_directory, keep_archive=True, max_depth=2, verify=
     extract_archive(archive_path, extract_directory, keep=True)
     extract_nested_archives(extract_directory, max_depth)
 
-    count, files_scanned, bytes_scanned = count_shader_containers(extract_directory)
-    log("Scanned {} file(s) ({}): found {} shader container(s)".format(
-        files_scanned, human_size(bytes_scanned), count))
+    scan = scan_for_shaders(extract_directory)
+    log("Scanned {} file(s) ({}): found {} shader container(s) and {} Xbox 360 compressed file(s)".format(
+        scan["files"], human_size(scan["size"]), scan["containers"], scan["compressed_files"]))
 
-    if verify and count == 0:
+    if scan["containers"] == 0 and scan["compressed_files"] != 0:
+        log("The archive holds Xbox 360 compressed games files, which the recompiler decompresses "
+            "while it scans them.")
+
+    if verify and scan["containers"] == 0 and scan["compressed_files"] == 0:
         raise FetchError(
             "No shader containers were found in the archive. The archive should contain the "
-            "game files with the compiled Xbox 360 shaders (for example the .ar archive or the "
-            "extracted game data). If the files are stored inside another archive format, unpack "
-            "them and share a plain .zip instead.")
+            "game files with the compiled Xbox 360 shaders (for example the shader .ar files or "
+            "the extracted game data). If the files are stored inside another archive format, "
+            "unpack them and share a plain .zip instead.")
 
     if not keep_archive and os.path.exists(archive_path):
         os.remove(archive_path)

@@ -5,13 +5,15 @@ name: Recompile Shaders
 #
 # The workflow works with direct links to .zip/.7z/.rar files, Google Drive links,
 # MediaFire links and GitHub release assets. Archives inside the archive (for example
-# the shader .ar file stored inside a zip) are extracted automatically.
+# the shader .ar file stored inside a zip) are extracted automatically, and the shader
+# archives of the game, such as shader_r.ar.00 and shader_r.arl, can be shared as they
+# are, because the recompiler decompresses them while it scans them.
 
 on:
   workflow_dispatch:
     inputs:
       shader_archive_url:
-        description: "Link to the archive with the shader files (.zip, Google Drive, MediaFire, ...)"
+        description: "Link to the archive with the shader files (.zip, Google Drive, MediaFire, ...). The shader archives of the game, such as shader_r.ar.00 and shader_r.arl, can be shared as they are."
         required: true
         type: string
       runner:
