@@ -6,7 +6,14 @@ name: Recompile Shaders
 # The graphics API input selects what the shaders are compiled to: "vulkan" only compiles
 # SPIR-V, "d3d12" only DXIL and "both" compiles each shader twice. A cache that only holds
 # SPIR-V is half the size and is the right choice for a Vulkan only port, while "d3d12" needs
-# the windows-latest runner to sign the DXIL blobs.
+# a Windows runner to sign the DXIL blobs.
+#
+# The build system is picked from the machine the job runs on and not from the runner input:
+# GitHub moved the windows-latest image to Visual Studio 2026 in June 2026, so a workflow that
+# hardcodes one Visual Studio generator fails on the other image ("could not find any instance
+# of Visual Studio"). The build step tries the Visual Studio 18 2026, 17 2022, 16 2019 and
+# 15 2017 generators in that order, keeps the first one that this machine has, and prints the
+# generators of the machine if it has none.
 #
 # The workflow works with direct links to .zip/.7z/.rar files, Google Drive links,
 # MediaFire links and GitHub release assets. Archives inside the archive (for example
@@ -22,12 +29,14 @@ on:
         required: true
         type: string
       runner:
-        description: "Build machine. Any of these works; only windows-latest produces signed DXIL. Use a label that exists in this repository."
+        description: "Build machine. Any of these works; only Windows machines produce signed DXIL. The generator is picked from the machine, so windows-latest (Visual Studio 2026 since June 2026) and windows-2022 (Visual Studio 2022) both build. Use a label that exists in this repository."
         required: true
         default: windows-latest
         type: choice
         options:
           - windows-latest
+          - windows-2022
+          - windows-2025
           - ubuntu-latest
           - macos-latest
       graphics_api:
@@ -228,37 +237,75 @@ jobs:
           CMAKE_ARGS+=(-DXENOS_RECOMP_EXTRA_DEFINES="$BUILD_DEFINES")
           CMAKE_ARGS+=(-DXENOS_RECOMP_DXIL="$XENOS_RECOMP_DXIL" -DXENOS_RECOMP_SPIRV="$XENOS_RECOMP_SPIRV")
 
-          # The build system is picked from the machine the job runs on, not from the runner
-          # input. A job can end up on a machine of another platform, and asking CMake for the
-          # Visual Studio generator on a machine without Visual Studio is what makes a run fail
-          # with "could not find any instance of Visual Studio".
+          # The build system is picked from the machine the job runs on, newest first. GitHub
+          # moved the windows-latest image to Visual Studio 2026 in June 2026 ("Visual Studio 18
+          # 2026", which needs CMake 4.2 or newer), while windows-2022 still ships Visual Studio
+          # 2022, so hardcoding one of the two makes a run fail on the other image.
           if [ "${RUNNER_OS:-unknown}" = "Windows" ]; then
-            GENERATORS=("Visual Studio 17 2022" "Visual Studio 16 2019" "Visual Studio 15 2017")
+            ATTEMPTS=(
+              "Visual Studio 18 2026|vs"
+              "Visual Studio 17 2022|vs"
+              "Visual Studio 16 2019|vs"
+              "Visual Studio 15 2017|vs"
+              "Ninja|single"
+            )
           else
-            GENERATORS=("")
+            ATTEMPTS=("default|single")
           fi
 
           built=0
 
-          for generator in "${GENERATORS[@]}"; do
-            if [ -n "$generator" ]; then
-              echo "Configuring with the '$generator' generator..."
+          for attempt in "${ATTEMPTS[@]}"; do
+            generator="${attempt%%|*}"
+            kind="${attempt##*|}"
+
+            if [ "$kind" = "vs" ]; then
+              LABEL="the '$generator' generator"
               CONFIGURE_ARGS=(-G "$generator" -A x64)
               BUILD_ARGS=(--config RelWithDebInfo)
-            else
-              echo "Configuring with the default generator..."
+            elif [ "$generator" = "default" ]; then
+              LABEL="the default generator"
               CONFIGURE_ARGS=(-DCMAKE_BUILD_TYPE=Release)
               BUILD_ARGS=()
+            else
+              LABEL="the '$generator' generator"
+              CONFIGURE_ARGS=(-G "$generator" -DCMAKE_BUILD_TYPE=RelWithDebInfo)
+              BUILD_ARGS=()
             fi
+
+            echo "Configuring with $LABEL..."
 
             # A build directory that was restored from the cache may belong to another generator,
             # which CMake refuses to reuse.
             rm -rf build
 
-            if cmake -B build "${CONFIGURE_ARGS[@]}" "${CMAKE_ARGS[@]}" && cmake --build build "${BUILD_ARGS[@]}" --parallel; then
-              built=1
-              break
+            set +e
+            configure_output=$(cmake -B build "${CONFIGURE_ARGS[@]}" "${CMAKE_ARGS[@]}" 2>&1)
+            configure_status=$?
+            set -e
+
+            echo "$configure_output"
+
+            if [ "$configure_status" != "0" ]; then
+              if echo "$configure_output" | grep -qE "Could not create named generator|could not find any instance of Visual Studio"; then
+                echo "::warning::$LABEL is not available on this machine, trying the next one."
+                continue
+              fi
+
+              echo "::error title=Build failed::CMake could not configure the build on this machine."
+              echo ""
+              echo "The generators that are available here are:"
+              cmake --help | sed -n '/^Generators/,$p' | head -n 40
+              exit 1
             fi
+
+            if ! cmake --build build "${BUILD_ARGS[@]}" --parallel; then
+              echo "::error title=Build failed::Compiling XenosRecomp failed, see the log above."
+              exit 1
+            fi
+
+            built=1
+            break
           done
 
           if [ "$built" != "1" ]; then

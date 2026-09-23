@@ -61,33 +61,72 @@ jobs:
           CMAKE_ARGS=(-DCMAKE_POLICY_VERSION_MINIMUM=3.5)
           CMAKE_ARGS+=(-DXENOS_RECOMP_DXIL="${{ matrix.dxil }}" -DXENOS_RECOMP_SPIRV=ON)
 
-          # The generator follows the machine the job runs on, so that no Visual Studio generator
-          # is requested on a machine without Visual Studio.
+          # The generator is picked from the machine, newest first: GitHub moved the windows-latest
+          # image to Visual Studio 2026 in June 2026 ("Visual Studio 18 2026", which needs CMake 4.2
+          # or newer), while windows-2022 still ships Visual Studio 2022.
           if [ "${RUNNER_OS:-unknown}" = "Windows" ]; then
-            GENERATORS=("Visual Studio 17 2022" "Visual Studio 16 2019" "Visual Studio 15 2017")
+            ATTEMPTS=(
+              "Visual Studio 18 2026|vs"
+              "Visual Studio 17 2022|vs"
+              "Visual Studio 16 2019|vs"
+              "Visual Studio 15 2017|vs"
+              "Ninja|single"
+            )
           else
-            GENERATORS=("")
+            ATTEMPTS=("default|single")
           fi
 
           built=0
 
-          for generator in "${GENERATORS[@]}"; do
-            if [ -n "$generator" ]; then
-              echo "Configuring with the '$generator' generator..."
+          for attempt in "${ATTEMPTS[@]}"; do
+            generator="${attempt%%|*}"
+            kind="${attempt##*|}"
+
+            if [ "$kind" = "vs" ]; then
+              LABEL="the '$generator' generator"
               CONFIGURE_ARGS=(-G "$generator" -A x64)
               BUILD_ARGS=(--config RelWithDebInfo)
-            else
-              echo "Configuring with the default generator..."
+            elif [ "$generator" = "default" ]; then
+              LABEL="the default generator"
               CONFIGURE_ARGS=(-DCMAKE_BUILD_TYPE=Release)
+              BUILD_ARGS=()
+            else
+              LABEL="the '$generator' generator"
+              CONFIGURE_ARGS=(-G "$generator" -DCMAKE_BUILD_TYPE=RelWithDebInfo)
               BUILD_ARGS=()
             fi
 
+            echo "Configuring with $LABEL..."
+
             rm -rf build
 
-            if cmake -B build "${CONFIGURE_ARGS[@]}" "${CMAKE_ARGS[@]}" && cmake --build build "${BUILD_ARGS[@]}" --parallel; then
-              built=1
-              break
+            set +e
+            configure_output=$(cmake -B build "${CONFIGURE_ARGS[@]}" "${CMAKE_ARGS[@]}" 2>&1)
+            configure_status=$?
+            set -e
+
+            echo "$configure_output"
+
+            if [ "$configure_status" != "0" ]; then
+              if echo "$configure_output" | grep -qE "Could not create named generator|could not find any instance of Visual Studio"; then
+                echo "::warning::$LABEL is not available on this machine, trying the next one."
+                continue
+              fi
+
+              echo "::error title=Build failed::CMake could not configure the build on this machine."
+              echo ""
+              echo "The generators that are available here are:"
+              cmake --help | sed -n '/^Generators/,$p' | head -n 40
+              exit 1
             fi
+
+            if ! cmake --build build "${BUILD_ARGS[@]}" --parallel; then
+              echo "::error title=Build failed::Compiling XenosRecomp failed, see the log above."
+              exit 1
+            fi
+
+            built=1
+            break
           done
 
           if [ "$built" != "1" ]; then
