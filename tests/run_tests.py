@@ -86,6 +86,26 @@ def test_single_shaders(tool, include, work_directory, expected):
             check(match is None, "generated HLSL references the undeclared boolean register '{}'".format(
                 match.group(0) if match else ""))
 
+            # A guard that is opened and not closed, or closed in the wrong place, produces HLSL
+            # that does not compile at all, which is worth catching before a compiler sees it.
+            check(hlsl.count("{") == hlsl.count("}"),
+                  "the generated HLSL has {} opening braces and {} closing braces".format(
+                      hlsl.count("{"), hlsl.count("}")))
+
+            if "expected_sequence" in entry:
+                # The parts have to appear in this order, which states where a guard opens, what it
+                # tests, which instructions fall inside it and where it closes again.
+                position = 0
+
+                for part in entry["expected_sequence"]:
+                    index = hlsl.find(part, position)
+
+                    check(index != -1,
+                          "'{}' is missing from the generated HLSL or comes out of order:\n{}".format(
+                              part.strip() or part, hlsl[-1500:]))
+
+                    position = index + len(part)
+
             if "expected_bit" in entry:
                 bit = entry["expected_bit"]
                 check("(g_Booleans & (1u << {}))".format(bit) in code,
@@ -161,10 +181,10 @@ def test_shader_cache(tool, include, work_directory, expected):
         check(report["failedShaders"] == 0, "{} test shaders failed to recompile".format(report["failedShaders"]))
 
         warnings = [warning for shader in report["shaders"] for warning in shader["warnings"]]
-        check(any("conditionally executes" in warning for warning in warnings),
-              "the conditional exec warning is missing from the report")
         check(any("outside of the 32-bit packed boolean range" in warning for warning in warnings),
               "the out of range boolean warning is missing from the report")
+        check(not any("conditionally executes" in warning for warning in warnings),
+              "conditional exec blocks are translated as conditions now, so they should not be warned about")
 
         if os.path.isdir(dump_path):
             check(not os.listdir(dump_path), "the failed shader directory should be empty")

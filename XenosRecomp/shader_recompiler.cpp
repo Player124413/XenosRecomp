@@ -2185,7 +2185,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
 
     // Unsupported or approximated control flow constructs are collected here so that they
     // end up in the recompilation report instead of silently affecting the generated shader.
-    std::set<uint32_t> conditionalExecRegisters;
     bool hasFunctionCalls = false;
 
     while (instrAddress < instrSize)
@@ -2211,7 +2210,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
             case ControlFlowOpcode::CondExecPredClean:
             case ControlFlowOpcode::CondExecPredCleanEnd:
                 address = cfInstr.condExec.address;
-                conditionalExecRegisters.insert(cfInstr.condExec.boolAddress);
                 break;
 
             case ControlFlowOpcode::CondExecPred:
@@ -2243,29 +2241,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
         instrAddress += 12;
     }
 
-    if (!conditionalExecRegisters.empty())
-    {
-        std::string registers;
-        size_t count = 0;
-
-        for (uint32_t boolAddress : conditionalExecRegisters)
-        {
-            if (count++ == 8)
-            {
-                registers += ", ...";
-                break;
-            }
-
-            registers += fmt::format("{}b{} (packed bit {})", registers.empty() ? "" : ", ", boolAddress,
-                getPackedBooleanIndex(boolAddress, isPixelShader));
-        }
-
-        warnings.push_back(fmt::format(
-            "Shader conditionally executes instructions based on boolean constants ({}). These blocks are "
-            "currently translated as unconditional blocks, which can produce incorrect results.",
-            registers));
-    }
-
     if (hasFunctionCalls)
     {
         warnings.push_back("Shader contains function calls (condcall/return), which are not translated. "
@@ -2290,6 +2265,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
     instrAddress = 0;
     uint32_t pc = 0;
 
+    // Conditional execution wraps the instruction block of a conditional exec in an if over the
+    // packed boolean constants. Consecutive conditional execs that test the same boolean in the
+    // same direction share one if, which is what the reference translator does as well; anything
+    // else that follows the block closes it.
+    bool execConditionOpen = false;
+    uint32_t execConditionBoolAddress = 0;
+    bool execConditionValue = false;
+
+    auto closeExecCondition = [&]()
+    {
+        if (!execConditionOpen)
+            return;
+
+        --indentation;
+        indent();
+        out += "}\n";
+
+        execConditionOpen = false;
+    };
+
     while (instrAddress < instrSize)
     {
         codes.code0 = controlFlowCode[0];
@@ -2299,6 +2294,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
 
         for (auto& cfInstr : controlFlow)
         {
+            // A conditional exec continues the block of the previous one only when it tests the
+            // same boolean in the same direction, in which case the open if covers both.
+            const bool isConditionalExec = cfInstr.opcode == ControlFlowOpcode::CondExec ||
+                cfInstr.opcode == ControlFlowOpcode::CondExecEnd ||
+                cfInstr.opcode == ControlFlowOpcode::CondExecPredClean ||
+                cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd;
+
+            const bool continuesExecCondition = execConditionOpen && isConditionalExec &&
+                cfInstr.condExec.boolAddress == execConditionBoolAddress &&
+                cfInstr.condExec.condition == execConditionValue;
+
+            // A nop executes nothing, so it does not end the block that a conditional exec guards.
+            if (!continuesExecCondition && cfInstr.opcode != ControlFlowOpcode::Nop)
+                closeExecCondition();
+
             if (!simpleControlFlow)
             {
                 indentation = 3;
@@ -2342,7 +2352,48 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
                 address = cfInstr.condExec.address;
                 count = cfInstr.condExec.count;
                 sequence = cfInstr.condExec.sequence;
-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
+                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
+
+                if (!continuesExecCondition)
+                {
+                    // The condition is read straight from the packed boolean value, like the
+                    // conditional jumps do it, because the boolean may not be part of the
+                    // reflection data at all.
+                    const uint32_t boolAddress = cfInstr.condExec.boolAddress;
+                    const uint32_t boolIndex = getPackedBooleanIndex(boolAddress, isPixelShader);
+                    const char* comparison = cfInstr.condExec.condition ? "!=" : "==";
+
+                    indent();
+
+                    if (boolIndex < PACKED_BOOLEAN_BITS)
+                    {
+                        auto findResult = boolConstants.find(boolIndex);
+                        if (findResult != boolConstants.end())
+                            println("if ((g_Booleans & (1u << {})) {} 0) // {} (b{})", boolIndex, comparison, findResult->second, boolAddress);
+                        else
+                            println("if ((g_Booleans & (1u << {})) {} 0) // b{} (boolean constant not in reflection data)", boolIndex, comparison, boolAddress);
+                    }
+                    else
+                    {
+                        // The block cannot be skipped correctly without knowing the value, but
+                        // executing it is what the hardware does when the boolean is set, which is
+                        // the case the game relies on in practice.
+                        warnings.push_back(fmt::format(
+                            "Conditional execution on boolean register b{} is outside of the {}-bit packed boolean range "
+                            "supported by the shader common header, so the block it guards is always executed.",
+                            boolAddress, PACKED_BOOLEAN_BITS));
+
+                        println("if ({}) // b{} is outside of the supported packed boolean range", comparison == "!=" ? "true" : "false", boolAddress);
+                    }
+
+                    indent();
+                    out += "{\n";
+                    ++indentation;
+
+                    execConditionOpen = true;
+                    execConditionBoolAddress = boolAddress;
+                    execConditionValue = cfInstr.condExec.condition;
+                }
                 break;
 
             case ControlFlowOpcode::CondExecPred:
@@ -2533,6 +2584,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
 
             if (shouldReturn)
             {
+                // The end of the shader is not part of the block a conditional exec guards, which is
+                // also where the reference translator closes the condition.
+                closeExecCondition();
+
                 if (isPixelShader)
                 {
                     specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
@@ -2595,6 +2650,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
         controlFlowCode += 3;
         instrAddress += 12;
     }
+
+    // A conditional exec at the end of the shader has no following instruction to close it.
+    closeExecCondition();
 
     if (!simpleControlFlow)
     {

@@ -109,6 +109,23 @@ def cond_jmp_instruction(address, bool_address, condition, is_unconditional=0, i
             .finish())
 
 
+def add_instruction(vector_dest=0, vector_write_mask=0b0001, src1_register=0, src2_register=0):
+    """Builds an "add rDst, rSrc1, rSrc2" ALU instruction.
+
+    The destination is written as the sources are read, so the instruction has no dependencies on
+    anything the shader declares and can be dropped into any block.
+    """
+    control = (vector_dest & 0x3F)
+    control |= (vector_write_mask & 0xF) << 16
+    sources = ((src1_register & 0xFF) << 16) | ((src2_register & 0xFF) << 8)
+    sources |= (0 << 24)          # vectorOpcode, 0 is add
+    sources |= (1 << 24 + 5)      # src3Select, 1 selects a register instead of a constant
+    sources |= (1 << 24 + 6)
+    sources |= (1 << 24 + 7)
+
+    return struct.pack(">III", control, 0, sources)
+
+
 def pack_instructions(instructions):
     """Packs control flow instructions into the 3 dword groups the hardware uses."""
     assert len(instructions) % 2 == 0, "instructions are stored in pairs"
@@ -469,22 +486,79 @@ def make_test_shaders(output_directory):
           dict(stage="ps", out_of_range_register=200))
 
     #
-    # Pixel shader with a conditional exec, which the recompiler currently translates as
-    # an unconditional block and reports as a warning.
+    # Pixel shader whose instruction blocks are executed conditionally. The blocks only run when
+    # b128 is set, and two blocks that test the same boolean share one guard.
+    #
+    # The control flow of a shader is stored in front of the instruction blocks, and the address of
+    # the first block tells the recompiler where the blocks start, so the two conditional execs
+    # live in the first two units and their blocks in the units after them.
     #
     table = ConstantTableBuilder()
     table.add_constant("g_TestConstant", REGISTER_SET_FLOAT4, 1, 1)
     table.add_constant("g_TestBoolean", REGISTER_SET_BOOL, 128, 1,
                        parameter_type=PARAMETER_TYPE_BOOL, rows=1, columns=1)
 
-    instructions = [
-        cond_exec_instruction(address=0, count=0, sequence=0, bool_address=128, condition=1, opcode=OPCODE_COND_EXEC),
+    control = pack_instructions([
+        cond_exec_instruction(address=2, count=1, sequence=0, bool_address=128, condition=1, opcode=OPCODE_COND_EXEC),
+        cond_exec_instruction(address=3, count=1, sequence=0, bool_address=128, condition=1, opcode=OPCODE_COND_EXEC),
+        exec_instruction(address=0, count=0, sequence=0, opcode=0),
         exec_instruction(address=0, count=0, sequence=0, opcode=OPCODE_EXEC_END),
-    ]
+    ])
 
+    block = add_instruction(vector_dest=0, vector_write_mask=0b0001, src1_register=0, src2_register=1)
+    guard = "\tif ((g_Booleans & (1u << 16)) != 0) // g_TestBoolean (b128)"
+
+    # Two blocks that test the same boolean share one guard, so the whole shader has one if that
+    # contains both instructions.
     write("ps_cond_exec.bin",
-          build_shader_container(True, table, pack_instructions(instructions), outputs=1),
-          dict(stage="ps", expected_warning="conditionally executes"))
+          build_shader_container(True, table, control + block + block, outputs=1),
+          dict(stage="ps", expected_sequence=[
+              guard, "\t{",
+              "\t\tr0.x = (float)((r0.x + r1.x));",
+              "\t\tr0.x = (float)((r0.x + r1.x));",
+              "\t}\n"]))
+
+    #
+    # The same, with the condition inverted and on a boolean register that is not part of the
+    # reflection data, which is the case that used to produce references to undeclared registers.
+    #
+    control = pack_instructions([
+        cond_exec_instruction(address=2, count=1, sequence=0, bool_address=130, condition=0, opcode=OPCODE_COND_EXEC),
+        exec_instruction(address=0, count=0, sequence=0, opcode=0),
+        exec_instruction(address=0, count=0, sequence=0, opcode=0),
+        exec_instruction(address=0, count=0, sequence=0, opcode=OPCODE_EXEC_END),
+    ])
+
+    write("ps_cond_exec_inverted.bin",
+          build_shader_container(True, table, control + block, outputs=1),
+          dict(stage="ps", expected_sequence=[
+              "\tif ((g_Booleans & (1u << 18)) == 0) // b130 (boolean constant not in reflection data)",
+              "\t{",
+              "\t\tr0.x = (float)((r0.x + r1.x));",
+              "\t}\n"]))
+
+    #
+    # A conditional exec in a shader that uses the program counter based control flow, where the
+    # guard has to end before the next case label instead of running over it.
+    #
+    control = pack_instructions([
+        cond_jmp_instruction(address=2, bool_address=0, condition=1, is_unconditional=1, direction=1),
+        exec_instruction(address=0, count=0, sequence=0, opcode=OPCODE_EXEC),
+        cond_exec_instruction(address=3, count=1, sequence=0, bool_address=128, condition=1, opcode=OPCODE_COND_EXEC),
+        exec_instruction(address=0, count=0, sequence=0, opcode=OPCODE_EXEC_END),
+    ])
+
+    write("ps_cond_exec_jump.bin",
+          build_shader_container(True, table, control + block + block, outputs=1),
+          dict(stage="ps", expected_sequence=[
+              "\t\tcase 2:",
+              "\t\t\tif ((g_Booleans & (1u << 16)) != 0) // g_TestBoolean (b128)",
+              "\t\t\t{",
+              "\t\t\t\tr0.x = (float)((r0.x + r1.x));",
+              "\t\t\t}\n",
+              # The guard has to end before the label of the next unit, or the jump target would
+              # sit inside a block that only runs conditionally.
+              "\t\tcase 3:"]))
 
     #
     # Boolean constants declared as arrays, which used to only register the first element.
