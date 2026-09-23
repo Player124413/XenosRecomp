@@ -189,9 +189,15 @@ jobs:
           set -e
 
           if [ "$TEST_STATUS" != "0" ]; then
+            # The message of a failing test carries the output of the recompiler after a colon,
+            # so both the beginning and the end of the log are repeated as annotations.
             while IFS= read -r line; do
               echo "::error title=Test failed::$line"
-            done < <(grep -E "FAIL|Traceback|Error|error" tests.log | head -n 10)
+            done < <(head -n 30 tests.log)
+
+            while IFS= read -r line; do
+              echo "::error title=Test output::$line"
+            done < <(tail -n 20 tests.log)
 
             echo "::error title=Test failed::The self tests of the recompiler did not pass, see the log above."
             exit 1
