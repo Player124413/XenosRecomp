@@ -2015,19 +2015,20 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
                 union
                 {
                     uint32_t value;
+                    // The struct is named because GCC rejects an unnamed struct inside a union.
                     struct
                     {
                         int8_t x;
                         int8_t y;
                         int8_t z;
                         int8_t w;
-                    };
+                    } bytes;
                 };
 
                 value = definition->values[i].get();
 
                 println("\tint4 i{} = int4({}, {}, {}, {});",
-                    (definition->registerIndex - 8992) / 4 + i, x, y, z, w);
+                    (definition->registerIndex - 8992) / 4 + i, bytes.x, bytes.y, bytes.z, bytes.w);
             }
             definitions += 2;
             definitions += definition->count;
@@ -2139,13 +2140,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
     union
     {
         ControlFlowInstruction controlFlow[2];
+        // The struct is named because GCC rejects an unnamed struct inside a union.
         struct
         {
             uint32_t code0;
             uint32_t code1;
             uint32_t code2;
             uint32_t code3;
-        };
+        } codes;
     };
 
     auto controlFlowCode = code;
@@ -2160,10 +2162,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
 
     while (instrAddress < instrSize)
     {
-        code0 = controlFlowCode[0];
-        code1 = controlFlowCode[1] & 0xFFFF;
-        code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
-        code3 = controlFlowCode[2] >> 16;
+        codes.code0 = controlFlowCode[0];
+        codes.code1 = controlFlowCode[1] & 0xFFFF;
+        codes.code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
+        codes.code3 = controlFlowCode[2] >> 16;
 
         for (auto& cfInstr : controlFlow)
         {
@@ -2262,10 +2264,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
 
     while (instrAddress < instrSize)
     {
-        code0 = controlFlowCode[0];
-        code1 = controlFlowCode[1] & 0xFFFF;
-        code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
-        code3 = controlFlowCode[2] >> 16;
+        codes.code0 = controlFlowCode[0];
+        codes.code1 = controlFlowCode[1] & 0xFFFF;
+        codes.code2 = (controlFlowCode[1] >> 16) | (controlFlowCode[2] << 16);
+        codes.code3 = controlFlowCode[2] >> 16;
 
         for (auto& cfInstr : controlFlow)
         {
@@ -2436,17 +2438,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSiz
                     VertexFetchInstruction vertexFetch;
                     TextureFetchInstruction textureFetch;
                     AluInstruction alu;
+                    // The struct is named because GCC rejects an unnamed struct inside a union.
                     struct
                     {
                         uint32_t code0;
                         uint32_t code1;
                         uint32_t code2;
-                    };
+                    } codes;
                 };
             
-                code0 = instructionCode[0];
-                code1 = instructionCode[1];
-                code2 = instructionCode[2];
+                codes.code0 = instructionCode[0];
+                codes.code1 = instructionCode[1];
+                codes.code2 = instructionCode[2];
             
                 if ((sequence & 0x1) != 0)
                 {
