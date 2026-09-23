@@ -1086,7 +1086,7 @@ static int recompileShaderCache(const Options& options, const std::string_view i
     }
 
     if (decompressedArchives != 0 || failedArchives != 0)
-        logLine("Decoded {} Xbox 360 compressed file(s) ({} incomplete), {} could not be decoded.",
+        logLine("Decoded {} shader archive(s) ({} incomplete), {} could not be decoded.",
             decompressedArchives, incompleteArchives, failedArchives);
 
     jobs.reserve(shaders.size());
@@ -1314,7 +1314,7 @@ static int recompileShaderCache(const Options& options, const std::string_view i
 
     if (incompleteArchives != 0)
     {
-        runWarnings.emplace_back(fmt::format("{} Xbox 360 compressed file(s) are cut off, so the shaders that are "
+        runWarnings.emplace_back(fmt::format("{} shader archive(s) are cut off, so the shaders that are "
             "missing from them are not part of the shader cache.", incompleteArchives));
         logLine("warning: {}", runWarnings.back());
     }

@@ -97,7 +97,7 @@ def main():
     compressed = report.get("decompressedArchives")
 
     if compressed:
-        print("| Xbox 360 compressed files decoded | {} |".format(compressed))
+        print("| Xbox 360 shader archives decoded | {} |".format(compressed))
 
     print()
     if api == "both":
