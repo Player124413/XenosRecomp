@@ -79,29 +79,57 @@ struct DeclUsageLocation
     uint32_t location;
 };
 
-// NOTE: These are specialized Vulkan locations for Unleashed Recompiled. Change as necessary. Likely not going to work with other games.
+// The Vulkan input locations of the vertex elements. The runtime that binds the vertex buffers
+// of the game uses the same numbers, so both sides have to agree on this table: a shader that
+// declares [[vk::location(N)]] for an element is fed by the input at location N, and a mismatch
+// binds the wrong data without failing anywhere.
+//
+// The numbering follows the order in which a vertex declaration lists its elements:
+// POSITION0, NORMAL0, TANGENT0, BINORMAL0, TEXCOORD0..3, COLOR0, BLENDINDICES0, BLENDWEIGHT0,
+// COLOR1 and then TEXCOORD4..23 at 12..31. This matches the locations of hedge-dev/XenosRecomp
+// and of the runtimes that were built against it (UnleashedRecomp and the XenonRecomp ports,
+// whose vertex declaration code carries the same list).
+//
+// NOTE: Change as necessary, but the runtime has to be changed together with it. An earlier
+// revision of this fork packed the elements (TEXCOORD0..3 at 13..16), which no runtime uses.
 static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
 {
     { DeclUsage::Position, 0, 0 },
-    { DeclUsage::Position, 1, 1 },
-    { DeclUsage::Position, 2, 2 },
-    { DeclUsage::Position, 3, 3 },
-    { DeclUsage::Normal, 0, 4 },
-    { DeclUsage::Normal, 1, 5 },
-    { DeclUsage::Normal, 2, 6 },
-    { DeclUsage::Normal, 3, 7 },
-    { DeclUsage::Tangent, 0, 8 },
-    { DeclUsage::Tangent, 1, 9 },
-    { DeclUsage::Tangent, 2, 10 },
-    { DeclUsage::Tangent, 3, 11 },
-    { DeclUsage::Binormal, 0, 12 },
-    { DeclUsage::TexCoord, 0, 13 },
-    { DeclUsage::TexCoord, 1, 14 },
-    { DeclUsage::TexCoord, 2, 15 },
-    { DeclUsage::TexCoord, 3, 16 },
-    { DeclUsage::Color, 0, 17 },
-    { DeclUsage::BlendIndices, 0, 18 },
-    { DeclUsage::BlendWeight, 0, 19 },
+    { DeclUsage::Normal, 0, 1 },
+    { DeclUsage::Tangent, 0, 2 },
+    { DeclUsage::Binormal, 0, 3 },
+    { DeclUsage::TexCoord, 0, 4 },
+    { DeclUsage::TexCoord, 1, 5 },
+    { DeclUsage::TexCoord, 2, 6 },
+    { DeclUsage::TexCoord, 3, 7 },
+    { DeclUsage::Color, 0, 8 },
+    { DeclUsage::BlendIndices, 0, 9 },
+    { DeclUsage::BlendWeight, 0, 10 },
+    { DeclUsage::Color, 1, 11 },
+    { DeclUsage::TexCoord, 4, 12 },
+    { DeclUsage::TexCoord, 5, 13 },
+    { DeclUsage::TexCoord, 6, 14 },
+    { DeclUsage::TexCoord, 7, 15 },
+    // Kept for compatibility with hedge-dev/XenosRecomp, where POSITION1 shares the location of
+    // TEXCOORD7, although no runtime asks for a second position that way.
+    { DeclUsage::Position, 1, 15 },
+    // TEXCOORD8..23 continue at 16..31, which is the last range the runtimes know about.
+    { DeclUsage::TexCoord, 8, 16 },
+    { DeclUsage::TexCoord, 9, 17 },
+    { DeclUsage::TexCoord, 10, 18 },
+    { DeclUsage::TexCoord, 11, 19 },
+    { DeclUsage::TexCoord, 12, 20 },
+    { DeclUsage::TexCoord, 13, 21 },
+    { DeclUsage::TexCoord, 14, 22 },
+    { DeclUsage::TexCoord, 15, 23 },
+    { DeclUsage::TexCoord, 16, 24 },
+    { DeclUsage::TexCoord, 17, 25 },
+    { DeclUsage::TexCoord, 18, 26 },
+    { DeclUsage::TexCoord, 19, 27 },
+    { DeclUsage::TexCoord, 20, 28 },
+    { DeclUsage::TexCoord, 21, 29 },
+    { DeclUsage::TexCoord, 22, 30 },
+    { DeclUsage::TexCoord, 23, 31 },
 };
 
 static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =

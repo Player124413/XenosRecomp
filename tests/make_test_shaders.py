@@ -398,6 +398,37 @@ def make_test_shaders(output_directory):
           dict(stage="ps", expected_bit=18, expected_register=130))
 
     #
+    # Vertex shader that declares the vertex elements with the usages whose Vulkan locations the
+    # runtimes know about, including TEXCOORD4 and COLOR1. A usage that is missing from
+    # USAGE_LOCATIONS makes the recompiler refuse to translate the shader, which is what the
+    # shaders of a game with more than four texture coordinates used to run into.
+    #
+    table = ConstantTableBuilder()
+    table.add_constant("g_TestConstant", REGISTER_SET_FLOAT4, 4, 1)
+
+    elements = [
+        (DECL_USAGE_POSITION, 0, 0),
+        (DECL_USAGE_TEXCOORD, 0, 4),
+        (DECL_USAGE_TEXCOORD, 1, 5),
+        (DECL_USAGE_TEXCOORD, 4, 12),
+        (DECL_USAGE_COLOR, 1, 11),
+    ]
+
+    instructions = [
+        exec_instruction(address=0, count=0, sequence=0, opcode=OPCODE_EXEC_END),
+        exec_instruction(address=0, count=0, sequence=0, opcode=OPCODE_EXEC_END),
+    ]
+
+    write("vs_usage_locations.bin",
+          build_shader_container(False, table, pack_instructions(instructions), outputs=0,
+                                 vertex_elements=[vertex_element_value(index * 4, usage, usage_index)
+                                                  for index, (usage, usage_index, _) in enumerate(elements)]),
+          dict(stage="vs", expected_locations=dict(
+              ("{}{}".format({DECL_USAGE_POSITION: "Position", DECL_USAGE_TEXCOORD: "TexCoord",
+                              DECL_USAGE_COLOR: "Color"}[usage], usage_index), location)
+              for usage, usage_index, location in elements)))
+
+    #
     # Vertex shader that jumps on a lower boolean register.
     #
     table = ConstantTableBuilder()

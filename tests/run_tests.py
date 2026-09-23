@@ -99,6 +99,19 @@ def test_single_shaders(tool, include, work_directory, expected):
                       "'{}' should recompile into the same shader as '{}', which holds the same shader in an "
                       "Xbox 360 compressed file".format(name, alias))
 
+            if "expected_locations" in entry:
+                # The declarations are checked as they are printed, so a usage that is missing
+                # from USAGE_LOCATIONS or that was moved to another location is caught here
+                # instead of in the runtime, where it would bind the wrong vertex data.
+                for element, location in sorted(entry["expected_locations"].items()):
+                    # The Vulkan location is written in front of the declaration and the location
+                    # of the AIR path behind it, which is how each of them is spelled.
+                    for line in ("[[vk::location({})]] float4 i{}".format(location, element),
+                                 "float4 i{} [[attribute({})]]".format(element, location)):
+                        check(line in hlsl,
+                              "expected '{}' in the generated HLSL, because the runtimes bind "
+                              "that element at location {}".format(line, location))
+
             if "out_of_range_register" in entry:
                 check("outside of the supported packed boolean range" in hlsl,
                       "expected a note about boolean register b{} being out of range".format(
