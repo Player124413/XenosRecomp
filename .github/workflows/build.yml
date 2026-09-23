@@ -107,11 +107,17 @@ jobs:
 
             echo "$configure_output"
 
+            # The messages of CMake and of the compiler are repeated as annotations below, so
+            # that a failed run shows what went wrong in the summary of the run.
             if [ "$configure_status" != "0" ]; then
               if echo "$configure_output" | grep -qE "Could not create named generator|could not find any instance of Visual Studio"; then
                 echo "::warning::$LABEL is not available on this machine, trying the next one."
                 continue
               fi
+
+              while IFS= read -r line; do
+                echo "::error title=Configure error::$line"
+              done < <(echo "$configure_output" | grep -E "CMake Error|CMake Warning" | head -n 10)
 
               echo "::error title=Build failed::CMake could not configure the build on this machine."
               echo ""
@@ -120,7 +126,14 @@ jobs:
               exit 1
             fi
 
-            if ! cmake --build build "${BUILD_ARGS[@]}" --parallel; then
+            cmake --build build "${BUILD_ARGS[@]}" --parallel 2>&1 | tee build.log
+            build_status=${PIPESTATUS[0]}
+
+            if [ "$build_status" != "0" ]; then
+              while IFS= read -r line; do
+                echo "::error title=Compile error::$line"
+              done < <(grep -E "error|Error" build.log | head -n 10)
+
               echo "::error title=Build failed::Compiling XenosRecomp failed, see the log above."
               exit 1
             fi
