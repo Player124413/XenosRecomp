@@ -110,7 +110,7 @@ jobs:
             # The messages of CMake and of the compiler are repeated as annotations below, so
             # that a failed run shows what went wrong in the summary of the run.
             if [ "$configure_status" != "0" ]; then
-              if echo "$configure_output" | grep -qE "Could not create named generator|could not find any instance of Visual Studio"; then
+              if grep -qE "Could not create named generator|could not find any instance of Visual Studio" <<< "$configure_output"; then
                 echo "::warning::$LABEL is not available on this machine, trying the next one."
                 continue
               fi
@@ -122,7 +122,7 @@ jobs:
               echo "::error title=Build failed::CMake could not configure the build on this machine."
               echo ""
               echo "The generators that are available here are:"
-              cmake --help | sed -n '/^Generators/,$p' | head -n 40
+              cmake --help | sed -n '/^Generators/,$p' | head -n 40 || true
               exit 1
             fi
 
@@ -150,7 +150,9 @@ jobs:
             exit 1
           fi
 
-          TOOL=$(find build -type f \( -name "XenosRecomp" -o -name "XenosRecomp.exe" \) | head -n 1)
+          # -print -quit stops at the first match: 'find | head' makes find die of SIGPIPE when
+          # there is more than one match, which pipefail turns into a failed step.
+          TOOL=$(find build -type f \( -name "XenosRecomp" -o -name "XenosRecomp.exe" \) -print -quit)
 
           if [ -z "$TOOL" ]; then
             echo "::error title=Build failed::XenosRecomp was not built."
@@ -167,7 +169,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          TOOL=$(find bin -type f \( -name "XenosRecomp" -o -name "XenosRecomp.exe" \) | head -n 1)
+          TOOL=$(find bin -type f \( -name "XenosRecomp" -o -name "XenosRecomp.exe" \) -print -quit)
 
           if [ -z "$TOOL" ]; then
             echo "::error title=Test failed::XenosRecomp was not built."

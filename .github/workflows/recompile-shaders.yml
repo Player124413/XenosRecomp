@@ -289,7 +289,7 @@ jobs:
             # The messages of CMake and of the compiler are repeated as annotations below, so
             # that a failed run shows what went wrong in the summary of the run.
             if [ "$configure_status" != "0" ]; then
-              if echo "$configure_output" | grep -qE "Could not create named generator|could not find any instance of Visual Studio"; then
+              if grep -qE "Could not create named generator|could not find any instance of Visual Studio" <<< "$configure_output"; then
                 echo "::warning::$LABEL is not available on this machine, trying the next one."
                 continue
               fi
@@ -301,12 +301,17 @@ jobs:
               echo "::error title=Build failed::CMake could not configure the build on this machine."
               echo ""
               echo "The generators that are available here are:"
-              cmake --help | sed -n '/^Generators/,$p' | head -n 40
+              cmake --help | sed -n '/^Generators/,$p' | head -n 40 || true
               exit 1
             fi
 
+            # GitHub runs bash with 'pipefail', so the status of the build has to be read from
+            # the pipeline: a failing build would otherwise end the step before the errors are
+            # repeated as annotations.
+            set +e
             cmake --build build "${BUILD_ARGS[@]}" --parallel 2>&1 | tee build.log
             build_status=${PIPESTATUS[0]}
+            set -e
 
             if [ "$build_status" != "0" ]; then
               while IFS= read -r line; do
@@ -325,7 +330,7 @@ jobs:
             echo "::error title=Build failed::CMake could not configure a build on this machine (${RUNNER_OS:-unknown}, runner '${{ inputs.runner }}'). Pick a runner label that matches the machines of this repository, or install a compiler on it."
             echo ""
             echo "The generators that are available here are:"
-            cmake --help | sed -n '/^Generators/,$p' | head -n 40
+            cmake --help | sed -n '/^Generators/,$p' | head -n 40 || true
             exit 1
           fi
 
