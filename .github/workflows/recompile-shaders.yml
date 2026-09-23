@@ -343,6 +343,13 @@ jobs:
 
           mkdir -p bin
           cp "$TOOL" bin/
+
+          # On Windows the recompiler is linked against the DirectX shader compiler and the DXIL
+          # validation library, which it loads from its own directory, so they have to be copied
+          # along with it. Linux and macOS find their shared libraries through the rpath.
+          find "$(dirname "$TOOL")" -maxdepth 1 -type f \( -name "*.dll" -o -name "*.so*" -o -name "*.dylib" \) \
+            -exec cp {} bin/ \; || true
+
           chmod +x "bin/$(basename "$TOOL")" || true
 
           echo "TOOL=$GITHUB_WORKSPACE/bin/$(basename "$TOOL")" >> "$GITHUB_ENV"
@@ -350,7 +357,20 @@ jobs:
 
       - name: Test the recompiler
         shell: bash
-        run: $PYTHON tests/run_tests.py --tool "$TOOL" --include XenosRecomp/shader_common.h
+        run: |
+          set +e
+          $PYTHON tests/run_tests.py --tool "$TOOL" --include XenosRecomp/shader_common.h 2>&1 | tee tests.log
+          TEST_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$TEST_STATUS" != "0" ]; then
+            while IFS= read -r line; do
+              echo "::error title=Test failed::$line"
+            done < <(grep -E "FAIL|Traceback|Error|error" tests.log | head -n 10)
+
+            echo "::error title=Test failed::The self tests of the recompiler did not pass, see the log above."
+            exit 1
+          fi
 
       - name: Download the shader archive
         shell: bash
