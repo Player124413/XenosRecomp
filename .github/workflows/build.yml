@@ -172,6 +172,57 @@ jobs:
 
           echo "Built $TOOL"
 
+      # Temporary: reports what the recompiler does on Windows, where it currently dies with
+      # 0xC0000409 without printing anything, so that the failing step can be narrowed down.
+      - name: Look at the recompiler on Windows
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "::notice title=Files in bin::$(ls -1 bin | tr '\n' ' ')"
+
+          BUILT=$(find build -type f -name "XenosRecomp.exe" -print -quit)
+          echo "::notice title=Built::the recompiler of the build tree is at $BUILT"
+
+          $PYTHON tests/make_test_shaders.py tmp-shaders > make.log 2>&1 || true
+          SAMPLE=$(find tmp-shaders -maxdepth 1 -type f -name "*.bin" -print -quit)
+          echo "::notice title=Sample::recompiling $SAMPLE"
+
+          run_and_report() {
+            local label="$1"
+            shift
+
+            set +e
+            "$@" > run.log 2>&1
+            local status=$?
+            set -e
+
+            echo "::notice title=$label::exited with $status"
+
+            while IFS= read -r line; do
+              echo "::notice title=$label output::$line"
+            done < <(head -n 25 run.log)
+          }
+
+          run_and_report "bin" "$TOOL"
+          run_and_report "build tree" "$BUILT"
+          run_and_report "shader from bin" "$TOOL" "$SAMPLE" tmp.hlsl XenosRecomp/shader_common.h
+          run_and_report "shader from build tree" "$BUILT" "$SAMPLE" tmp.hlsl XenosRecomp/shader_common.h
+
+          CDB="/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe"
+
+          if [ -f "$CDB" ]; then
+            set +e
+            "$CDB" -o -c "g; kb 25; q" "$BUILT" "$SAMPLE" tmp.hlsl XenosRecomp/shader_common.h > cdb.log 2>&1
+            set -e
+
+            while IFS= read -r line; do
+              echo "::notice title=Debugger::$line"
+            done < <(tail -n 45 cdb.log)
+          else
+            echo "::notice title=Debugger::cdb.exe was not found on this runner."
+          fi
+
       - name: Test
         shell: bash
         run: |
