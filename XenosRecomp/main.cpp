@@ -773,7 +773,7 @@ static std::vector<uint8_t> decodeArchiveParts(const std::vector<std::vector<uin
     if (allContainers)
     {
         std::vector<uint8_t> result;
-        bool complete = true;
+        uint32_t incomplete = 0;
         bool failed = false;
 
         for (size_t i = 0; i < parts.size() && !failed; i++)
@@ -781,7 +781,10 @@ static std::vector<uint8_t> decodeArchiveParts(const std::vector<std::vector<uin
             try
             {
                 auto decoded = XCompressContainer::decompress(parts[i].data(), parts[i].size());
-                complete &= decoded.complete;
+
+                if (!decoded.complete)
+                    incomplete++;
+
                 result.insert(result.end(), decoded.data.begin(), decoded.data.end());
             }
             catch (const std::exception& error)
@@ -793,9 +796,11 @@ static std::vector<uint8_t> decodeArchiveParts(const std::vector<std::vector<uin
 
         if (!failed)
         {
-            status = complete
-                ? fmt::format("decompressed {} part(s) (Xbox 360 compression)", parts.size())
-                : fmt::format("decompressed {} part(s), the last one is incomplete", parts.size());
+            status = fmt::format("decompressed {} file(s) (Xbox 360 compression)", parts.size());
+
+            if (incomplete != 0)
+                status += fmt::format(", {} of them are cut off", incomplete);
+
             return result;
         }
     }
@@ -809,7 +814,16 @@ static std::vector<uint8_t> decodeArchiveParts(const std::vector<std::vector<uin
 
             if (decoded.complete)
             {
-                status = "decompressed 1 part (Xbox 360 compression)";
+                status = "decompressed 1 file (Xbox 360 compression)";
+                return decoded.data;
+            }
+
+            if (!decoded.data.empty())
+            {
+                // The stream is cut off, but everything up to the end of the last complete block is
+                // still usable, so it is handed over instead of the compressed data.
+                status = fmt::format("decompressed {} block(s) (Xbox 360 compression), the stream is cut off",
+                    decoded.blockCount);
                 return decoded.data;
             }
         }
@@ -876,6 +890,7 @@ static int recompileShaderCache(const Options& options, const std::string_view i
     }
 
     uint32_t decompressedArchives = 0;
+    uint32_t incompleteArchives = 0;
     uint32_t failedArchives = 0;
 
     for (const auto& key : archiveOrder)
@@ -932,15 +947,20 @@ static int recompileShaderCache(const Options& options, const std::string_view i
             }
         });
 
+        const bool decompressed = status.find("decompressed") == 0;
+
+        if (decompressed && status.find("cut off") != std::string::npos)
+            incompleteArchives++;
+
         if (foundAny)
         {
-            if (status.find("decompressed") == 0)
+            if (decompressed)
                 decompressedArchives++;
 
             logLine("Found shaders in '{}' ({} bytes): {}", key, stream.size(), status);
             files.emplace_back(std::move(stream));
         }
-        else if (status.find("decompressed") == 0)
+        else if (decompressed)
         {
             decompressedArchives++;
         }
@@ -952,7 +972,8 @@ static int recompileShaderCache(const Options& options, const std::string_view i
     }
 
     if (decompressedArchives != 0 || failedArchives != 0)
-        logLine("Decoded {} Xbox 360 compressed file(s), {} could not be decoded.", decompressedArchives, failedArchives);
+        logLine("Decoded {} Xbox 360 compressed file(s) ({} incomplete), {} could not be decoded.",
+            decompressedArchives, incompleteArchives, failedArchives);
 
     jobs.reserve(shaders.size());
     shaderStorages.reserve(shaders.size());
@@ -1166,6 +1187,14 @@ static int recompileShaderCache(const Options& options, const std::string_view i
     }
 
     std::vector<std::string> runWarnings;
+
+    if (incompleteArchives != 0)
+    {
+        runWarnings.emplace_back(fmt::format("{} Xbox 360 compressed file(s) are cut off, so the shaders that are "
+            "missing from them are not part of the shader cache.", incompleteArchives));
+        logLine("warning: {}", runWarnings.back());
+    }
+
     if (g_unsignedDxil)
     {
         runWarnings.emplace_back("The DXIL blobs were not signed. This happens when the recompiler is not built with "

@@ -208,9 +208,16 @@ XCompressContainer::Result XCompressContainer::decompress(const uint8_t* data, s
 
         if (compressedBlockSize > remaining)
         {
-            throw std::runtime_error(fmt::format(
-                "The Xbox 360 compressed file ends in the middle of block {} ({} of {} bytes available).",
-                result.blockCount, remaining, compressedBlockSize));
+            // The file is cut off. Everything that was decoded so far is still usable, so the
+            // blocks before the cut are kept instead of dropping the whole file.
+            if (result.blockCount == 0)
+            {
+                throw std::runtime_error(fmt::format(
+                    "The Xbox 360 compressed file ends in the middle of block {} ({} of {} bytes available).",
+                    result.blockCount, remaining, compressedBlockSize));
+            }
+
+            break;
         }
 
         const size_t uncompressedBlockBytes = std::min<size_t>(uncompressedBlockSize, output.size - output.position);
@@ -231,6 +238,11 @@ XCompressContainer::Result XCompressContainer::decompress(const uint8_t* data, s
 
         if (status != MSPACK_ERR_OK)
         {
+            // Keep the blocks that were decoded correctly, the caller reports the file as
+            // incomplete.
+            if (result.blockCount != 0)
+                break;
+
             throw std::runtime_error(fmt::format("Block {} of the Xbox 360 compressed file is invalid: {}.",
                 result.blockCount, describeError(status)));
         }

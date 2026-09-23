@@ -268,7 +268,7 @@ def test_archives(tool, include, work_directory, archives):
     cases = (
         ("split", "archive that was split into two compressed files", 2),
         ("joined", "archive that was split in the middle of the stream", 1),
-        ("broken", "archive with a corrupted part", 1),
+        ("broken", "archive with a corrupted part", 2),
     )
 
     for key, description, expectedShaders in cases:
@@ -298,6 +298,8 @@ def test_archives(tool, include, work_directory, archives):
                 check("could not be decoded" in output,
                       "the corrupted part of the {} was not reported".format(description))
                 check(code == 0, "the {} made the recompiler exit with {}".format(description, code))
+                check(any("cut off" in warning for warning in report["warnings"]),
+                      "the archive that is cut off in the middle of a block should be reported as a warning")
 
             print("  ok   {}".format(description))
         except (TestFailure, OSError, ValueError) as error:

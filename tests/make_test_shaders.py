@@ -170,10 +170,22 @@ def lzx_stream(data):
     return stream
 
 
-def xcompress_container(data, window_size=0x10000, partition_size=0x80000, uncompressed_block_size=None):
-    """Builds an Xbox 360 compressed file holding the data in a single block."""
-    payload = struct.pack(">H", len(lzx_stream(data))) + lzx_stream(data)
-    uncompressed_block_size = uncompressed_block_size or len(data)
+def xcompress_container(data, block_size=None, window_size=0x10000, partition_size=0x80000):
+    """Builds an Xbox 360 compressed file holding the data, split into blocks of block_size bytes.
+
+    Every block is an LZX stream of its own, which is how the games store their files: a block
+    holds 'block_size' uncompressed bytes, except for the last one, which holds the remainder.
+    """
+    block_size = block_size or len(data)
+    blocks = bytearray()
+    compressed_size = 0
+
+    for offset in range(0, len(data), block_size):
+        stream = lzx_stream(data[offset:offset + block_size])
+        payload = struct.pack(">H", len(stream)) + stream
+        blocks += struct.pack(">I", len(payload))
+        blocks += payload
+        compressed_size += 4 + len(payload)
 
     header = struct.pack(">IIIIIIIIIIII",
         XCOMPRESS_SIGNATURE,           # identifier
@@ -185,11 +197,11 @@ def xcompress_container(data, window_size=0x10000, partition_size=0x80000, uncom
         0,                             # uncompressed size, high
         len(data),                     # uncompressed size, low
         0,                             # compressed size, high
-        len(payload) + 4,              # compressed size, low
-        uncompressed_block_size,       # uncompressed block size
-        len(payload))                  # compressed block size, maximum
+        compressed_size,               # compressed size, low
+        block_size,                    # uncompressed block size
+        compressed_size)               # compressed block size, maximum
 
-    return header + struct.pack(">I", len(payload)) + payload
+    return header + bytes(blocks)
 
 
 class ConstantTableBuilder:
@@ -499,6 +511,13 @@ def write_archives(output_directory, ps_shader, vs_shader):
 
     with open(os.path.join(joined_directory, "shader.ar.01"), "wb") as f:
         f.write(container[cut:])
+
+    # An archive that is cut off in the middle of its last block. Everything before the cut is
+    # still usable, so the shaders of the complete blocks have to be recompiled.
+    truncated = xcompress_container(vs_shader + ps_shader, block_size=len(vs_shader))
+
+    with open(os.path.join(broken_directory, "truncated.ar.00"), "wb") as f:
+        f.write(truncated[:len(truncated) - 16])
 
     # A valid compressed file next to one whose payload was overwritten, which has to be
     # reported as an archive without shaders instead of taking the recompiler down.
