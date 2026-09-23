@@ -1,12 +1,24 @@
 project(XenosRecomp)
 
+# DXIL produced on other platforms cannot be signed by the DirectX Shader Compiler because
+# DXIL.dll only ships for Windows, so only Windows builds sign their shaders and shaders
+# built elsewhere may be rejected by the driver.
+set(XENOS_RECOMP_DXIL_DEFAULT OFF)
 if (WIN32)
-    option(XENOS_RECOMP_DXIL "Generate DXIL shader cache" ON)
+    set(XENOS_RECOMP_DXIL_DEFAULT ON)
 endif()
+
+option(XENOS_RECOMP_DXIL "Generate DXIL shader cache" ${XENOS_RECOMP_DXIL_DEFAULT})
 
 if (APPLE)
     option(XENOS_RECOMP_AIR "Generate Metal AIR shader cache" ON)
 endif()
+
+# Compile definitions that describe the target game, for example UNLEASHED_RECOMP or
+# MARATHON_RECOMP. Recompilers built by a game project usually set these through
+# target_compile_definitions instead.
+set(XENOS_RECOMP_EXTRA_DEFINES "" CACHE STRING
+    "Additional compile definitions to pass to XenosRecomp (semicolon separated)")
 
 set(SMOLV_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/smol-v/source")
 
@@ -32,8 +44,12 @@ target_include_directories(XenosRecomp PRIVATE ${SMOLV_SOURCE_DIR})
 
 target_precompile_headers(XenosRecomp PRIVATE pch.h)
 
+# The shader structures are defined with anonymous structs inside unions, which is an
+# extension supported by MSVC, Clang and GCC.
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     target_compile_options(XenosRecomp PRIVATE -Wno-switch -Wno-unused-variable -Wno-null-arithmetic -fms-extensions)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(XenosRecomp PRIVATE -Wno-switch -Wno-unused-variable -fms-extensions)
 endif()
 
 if (WIN32)
@@ -44,9 +60,19 @@ if (WIN32)
     )
 endif()
 
+if (XENOS_RECOMP_EXTRA_DEFINES)
+    target_compile_definitions(XenosRecomp PRIVATE ${XENOS_RECOMP_EXTRA_DEFINES})
+endif()
+
 if (XENOS_RECOMP_DXIL)
     target_compile_definitions(XenosRecomp PRIVATE XENOS_RECOMP_DXIL)
-    target_link_libraries(XenosRecomp PRIVATE Microsoft::DXIL)
+
+    if (TARGET Microsoft::DXIL)
+        target_link_libraries(XenosRecomp PRIVATE Microsoft::DXIL)
+    else()
+        message(WARNING "DXIL support was enabled, but the DXIL validation library is not available on this "
+            "platform. The generated DXIL will not be signed and may be rejected by the driver.")
+    endif()
 endif()
 
 if (XENOS_RECOMP_AIR)

@@ -2,20 +2,51 @@
 
 DxcCompiler::DxcCompiler()
 {
-    HRESULT hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
-    assert(SUCCEEDED(hr));
+    DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+    // dxcCompiler stays null when the DirectX Shader Compiler is unavailable, which is
+    // reported by the caller instead of terminating the process here.
 }
 
 DxcCompiler::~DxcCompiler()
 {
-    dxcCompiler->Release();
+    if (dxcCompiler != nullptr)
+        dxcCompiler->Release();
 }
 
-IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixelShader, bool compileLibrary, bool compileSpirv)
+// Makes DXC report diagnostics with the name of the shader that is being compiled
+// instead of the generic "hlsl.hlsl" name it uses for in-memory sources.
+static std::string makeSourceDirective(const std::string& sourceName)
 {
-    DxcBuffer source{};
-    source.Ptr = shaderSource.c_str();
-    source.Size = shaderSource.size();
+    if (sourceName.empty())
+        return {};
+
+    std::string name = sourceName;
+    for (char& c : name)
+    {
+        if (c == '\\' || c == '"' || c == '\n' || c == '\r')
+            c = '/';
+    }
+
+    return fmt::format("#line 2 \"{}\"\n", name);
+}
+
+DxcCompileResult DxcCompiler::compile(const std::string& shaderSource, bool compilePixelShader, bool compileLibrary, bool compileSpirv,
+    const std::string& sourceName)
+{
+    DxcCompileResult compileResult {};
+
+    if (dxcCompiler == nullptr)
+    {
+        compileResult.errorCode = E_FAIL;
+        compileResult.errors = "The DirectX Shader Compiler is not available.";
+        return compileResult;
+    }
+
+    std::string source = makeSourceDirective(sourceName) + shaderSource;
+
+    DxcBuffer buffer{};
+    buffer.Ptr = source.c_str();
+    buffer.Size = source.size();
 
     const wchar_t* args[32]{};
     uint32_t argCount = 0;
@@ -23,7 +54,7 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
     const wchar_t* target = nullptr;
     if (compileLibrary)
     {
-        assert(!compileSpirv);
+        // Libraries are only supported by DXIL; SPIR-V has no library profile.
         target = L"-T lib_6_3";
     }
     else
@@ -67,42 +98,67 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
 #endif
 
     IDxcResult* result = nullptr;
-    HRESULT hr = dxcCompiler->Compile(&source, args, argCount, nullptr, IID_PPV_ARGS(&result));
+    HRESULT hr = dxcCompiler->Compile(&buffer, args, argCount, nullptr, IID_PPV_ARGS(&result));
 
-    IDxcBlob* object = nullptr;
-    if (SUCCEEDED(hr))
+    if (FAILED(hr) || result == nullptr)
     {
-        assert(result != nullptr);
+        compileResult.errorCode = hr;
+        compileResult.errors = fmt::format("The DirectX Shader Compiler failed to run (0x{:08X}).", uint32_t(hr));
 
-        HRESULT status;
-        hr = result->GetStatus(&status);
-        assert(SUCCEEDED(hr));
+        if (result != nullptr)
+            result->Release();
 
-        if (FAILED(status))
+        return compileResult;
+    }
+
+    HRESULT status = E_FAIL;
+    hr = result->GetStatus(&status);
+
+    if (SUCCEEDED(hr) && SUCCEEDED(status))
+    {
+        hr = result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&compileResult.object), nullptr);
+
+        if (FAILED(hr) || compileResult.object == nullptr)
         {
-            if (result->HasOutput(DXC_OUT_ERRORS))
-            {
-                IDxcBlobUtf8* errors = nullptr;
-                hr = result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
-                assert(SUCCEEDED(hr) && errors != nullptr);
-
-                fputs(errors->GetStringPointer(), stderr);
-
-                errors->Release();
-            }
+            compileResult.object = nullptr;
+            compileResult.errorCode = hr;
+            compileResult.errors = "The DirectX Shader Compiler did not return a shader object.";
         }
-        else
-        {
-            hr = result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
-            assert(SUCCEEDED(hr) && object != nullptr);
-        }
-
-        result->Release();
     }
     else
     {
-        assert(result == nullptr);
+        compileResult.errorCode = FAILED(hr) ? hr : status;
     }
 
-    return object;
+    if (result->HasOutput(DXC_OUT_ERRORS))
+    {
+        IDxcBlobUtf8* errors = nullptr;
+        if (SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr)) && errors != nullptr)
+        {
+            const char* text = errors->GetStringPointer();
+            size_t textSize = errors->GetStringLength();
+
+            if (text != nullptr && textSize != 0)
+            {
+                compileResult.errors.assign(text, textSize);
+
+                // DXC terminates diagnostics with a newline, which would otherwise produce
+                // empty lines when the message is embedded into reports.
+                while (!compileResult.errors.empty() &&
+                    (compileResult.errors.back() == '\n' || compileResult.errors.back() == '\r'))
+                {
+                    compileResult.errors.pop_back();
+                }
+            }
+
+            errors->Release();
+        }
+    }
+
+    result->Release();
+
+    if (compileResult.object == nullptr && compileResult.errors.empty())
+        compileResult.errors = "The DirectX Shader Compiler failed without producing any diagnostics.";
+
+    return compileResult;
 }

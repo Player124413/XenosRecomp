@@ -1,0 +1,74 @@
+name: Build
+
+# Builds the recompiler on every platform and runs the self-test suite, which
+# recompiles generated shaders and checks the output, including the handling of
+# boolean constant registers such as b128/b129/b130.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            preset: "Visual Studio 17 2022"
+          - os: ubuntu-latest
+            preset: ""
+          - os: macos-latest
+            preset: ""
+
+    env:
+      PYTHON: ${{ matrix.os == 'windows-latest' && 'python' || 'python3' }}
+
+    steps:
+      - name: Check out the recompiler
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -e
+
+          # DXIL is enabled everywhere so that the DXIL code path is compiled and tested on
+          # every platform. Only Windows builds load the validation library, which is what
+          # signs the shaders for the driver.
+          CMAKE_ARGS="-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$GITHUB_WORKSPACE/bin -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DXENOS_RECOMP_DXIL=ON"
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cmake -B build -G "${{ matrix.preset }}" -A x64 $CMAKE_ARGS
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release $CMAKE_ARGS
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          set -e
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cmake --build build --config RelWithDebInfo --parallel
+          else
+            cmake --build build --parallel
+          fi
+
+      - name: Test
+        shell: bash
+        run: |
+          set -e
+          TOOL=$(find bin -type f \( -name "XenosRecomp" -o -name "XenosRecomp.exe" \) | head -n 1)
+          chmod +x "$TOOL" || true
+          $PYTHON tests/run_tests.py --tool "$TOOL" --include XenosRecomp/shader_common.h

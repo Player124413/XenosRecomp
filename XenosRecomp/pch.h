@@ -13,6 +13,7 @@
 #include <execution>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <smolv.h>
 #include <fmt/core.h>
 #include <string>
@@ -31,9 +32,11 @@ static T byteSwap(T value)
         return static_cast<T>(__builtin_bswap32(static_cast<uint32_t>(value)));
     else if constexpr (sizeof(T) == 8) 
         return static_cast<T>(__builtin_bswap64(static_cast<uint64_t>(value)));
-
-    assert(false && "Unexpected byte size.");
-    return value;
+    else
+    {
+        static_assert(sizeof(T) == 8, "Unexpected byte size.");
+        return value;
+    }
 }
 
 template<typename T>

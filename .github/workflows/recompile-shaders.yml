@@ -1,0 +1,324 @@
+name: Recompile Shaders
+
+# Paste a link to an archive with the game's shader files, press "Run workflow", and
+# download the recompiled shader cache from the artifacts of the run.
+#
+# The workflow works with direct links to .zip/.7z/.rar files, Google Drive links,
+# MediaFire links and GitHub release assets. Archives inside the archive (for example
+# the shader .ar file stored inside a zip) are extracted automatically.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shader_archive_url:
+        description: "Link to the archive with the shader files (.zip, Google Drive, MediaFire, ...)"
+        required: true
+        type: string
+      runner:
+        description: "Build machine. Only windows-latest produces signed DXIL."
+        required: true
+        default: windows-latest
+        type: choice
+        options:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+      game_configuration:
+        description: "Game specific recompiler code to build with"
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - UNLEASHED_RECOMP
+          - MARATHON_RECOMP
+      shader_common_header_url:
+        description: "Optional link to a custom shader_common.h (defaults to the one in this repository)"
+        required: false
+        default: ""
+        type: string
+      shader_cache_file:
+        description: "File name of the generated shader cache"
+        required: false
+        default: "shader_cache.cpp"
+        type: string
+      fail_on_shader_errors:
+        description: "Fail the run when shaders could not be recompiled"
+        required: false
+        default: true
+        type: boolean
+      commit_shader_cache:
+        description: "Commit the shader cache to a new branch and open a pull request"
+        required: false
+        default: false
+        type: boolean
+
+  # Allows a game repository to run the same steps:
+  #   uses: Player124413/XenosRecomp/.github/workflows/recompile-shaders.yml@main
+  workflow_call:
+    inputs:
+      shader_archive_url:
+        required: true
+        type: string
+      runner:
+        required: false
+        default: windows-latest
+        type: string
+      game_configuration:
+        required: false
+        default: none
+        type: string
+      shader_common_header_url:
+        required: false
+        default: ""
+        type: string
+      shader_cache_file:
+        required: false
+        default: "shader_cache.cpp"
+        type: string
+      fail_on_shader_errors:
+        required: false
+        default: true
+        type: boolean
+      commit_shader_cache:
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      artifact_name:
+        description: "Name of the artifact that contains the shader cache"
+        value: ${{ jobs.recompile.outputs.artifact_name }}
+      shader_cache:
+        description: "File name of the generated shader cache inside the artifact"
+        value: ${{ jobs.recompile.outputs.shader_cache }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner }}
+  cancel-in-progress: true
+
+jobs:
+  recompile:
+    runs-on: ${{ inputs.runner }}
+    name: Recompile shaders
+
+    outputs:
+      artifact_name: ${{ steps.publish.outputs.artifact_name }}
+      shader_cache: ${{ steps.publish.outputs.shader_cache }}
+
+    env:
+      PYTHON: ${{ inputs.runner == 'windows-latest' && 'python' || 'python3' }}
+      SHADER_ARCHIVE_URL: ${{ inputs.shader_archive_url }}
+      GAME_CONFIGURATION: ${{ inputs.game_configuration }}
+      SHADER_COMMON_HEADER_URL: ${{ inputs.shader_common_header_url }}
+      SHADER_CACHE_FILE: ${{ inputs.shader_cache_file }}
+      FAIL_ON_SHADER_ERRORS: ${{ inputs.fail_on_shader_errors }}
+
+    steps:
+      - name: Check out the recompiler
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve inputs
+        shell: bash
+        run: |
+          set -e
+
+          if [ -z "$SHADER_ARCHIVE_URL" ]; then
+            echo "::error title=Missing archive link::No archive link was given. Paste a direct link to a .zip with the shader files into the 'shader_archive_url' input."
+            exit 1
+          fi
+
+          ARTIFACT_NAME="shader-cache-$(echo "${{ inputs.runner }}" | tr -d ' -')-${{ github.run_number }}"
+
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+          echo "SHADER_CACHE_FILE=${SHADER_CACHE_FILE:-shader_cache.cpp}" >> "$GITHUB_ENV"
+          echo "SHADER_DIR=$GITHUB_WORKSPACE/shader-data" >> "$GITHUB_ENV"
+          echo "CACHE_PATH=$GITHUB_WORKSPACE/out/$SHADER_CACHE_FILE" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=$GITHUB_WORKSPACE/out/recompile-report.json" >> "$GITHUB_ENV"
+          echo "FAILED_DIR=$GITHUB_WORKSPACE/out/failed-shaders" >> "$GITHUB_ENV"
+          echo "LOG_PATH=$GITHUB_WORKSPACE/out/recompile.log" >> "$GITHUB_ENV"
+          echo "BUILD_DEFINES=${GAME_CONFIGURATION/none/}" >> "$GITHUB_ENV"
+
+      - name: Set up the compiler cache
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: build-${{ inputs.runner }}-${{ inputs.game_configuration }}-${{ hashFiles('XenosRecomp/**', 'CMakeLists.txt', 'thirdparty/CMakeLists.txt') }}
+          restore-keys: |
+            build-${{ inputs.runner }}-${{ inputs.game_configuration }}-
+
+      - name: Build the recompiler
+        shell: bash
+        run: |
+          set -e
+
+          CMAKE_ARGS="-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$GITHUB_WORKSPACE/bin -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DXENOS_RECOMP_EXTRA_DEFINES=$BUILD_DEFINES"
+
+          if [ "${{ inputs.runner }}" = "windows-latest" ]; then
+            cmake -B build -G "Visual Studio 17 2022" -A x64 $CMAKE_ARGS
+            cmake --build build --config RelWithDebInfo --parallel
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release $CMAKE_ARGS
+            cmake --build build --parallel
+          fi
+
+          TOOL=$(find bin -type f \( -name "XenosRecomp" -o -name "XenosRecomp.exe" \) | head -n 1)
+
+          if [ -z "$TOOL" ]; then
+            echo "::error title=Build failed::XenosRecomp was not built."
+            exit 1
+          fi
+
+          chmod +x "$TOOL" || true
+          echo "TOOL=$GITHUB_WORKSPACE/$TOOL" >> "$GITHUB_ENV"
+          echo "Built $TOOL"
+
+      - name: Test the recompiler
+        shell: bash
+        run: $PYTHON tests/run_tests.py --tool "$TOOL" --include XenosRecomp/shader_common.h
+
+      - name: Download the shader archive
+        shell: bash
+        run: |
+          set -e
+          $PYTHON scripts/fetch_shader_archive.py "$SHADER_ARCHIVE_URL" "$SHADER_DIR" | tee fetch.log
+          RESULT_DIR=$(grep '^RESULT_DIR=' fetch.log | tail -n 1 | cut -d= -f2-)
+          echo "SHADER_EXTRACT_DIR=$RESULT_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up the shader common header
+        shell: bash
+        run: |
+          set -e
+
+          HEADER=XenosRecomp/shader_common.h
+
+          if [ -n "$SHADER_COMMON_HEADER_URL" ]; then
+            mkdir -p custom
+            $PYTHON -c "import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+              "$SHADER_COMMON_HEADER_URL" custom/shader_common.h
+            HEADER=custom/shader_common.h
+            echo "Using the shader common header from $SHADER_COMMON_HEADER_URL"
+          fi
+
+          echo "SHADER_COMMON_HEADER=$GITHUB_WORKSPACE/$HEADER" >> "$GITHUB_ENV"
+
+      - name: Recompile the shaders
+        id: recompile
+        shell: bash
+        run: |
+          set -o pipefail
+
+          mkdir -p out
+
+          FAILURE_ARG=""
+          if [ "$FAIL_ON_SHADER_ERRORS" != "true" ]; then
+            FAILURE_ARG="--allow-failures"
+          fi
+
+          set +e
+          "$TOOL" "$SHADER_EXTRACT_DIR" "$CACHE_PATH" "$SHADER_COMMON_HEADER" \
+            --report "$REPORT_PATH" \
+            --dump-failed "$FAILED_DIR" \
+            $FAILURE_ARG 2>&1 | tee "$LOG_PATH"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$STATUS" >> "$GITHUB_OUTPUT"
+
+          if [ -s "$CACHE_PATH" ]; then
+            echo "### Shader cache" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Generated \`$SHADER_CACHE_FILE\` ($(du -h "$CACHE_PATH" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$STATUS" != "0" ]; then
+            echo "::error title=Shader recompilation failed::Some shaders could not be recompiled. See the job summary and the failed-shaders artifact for details."
+          fi
+
+          exit $STATUS
+
+      - name: Write the job summary
+        if: always()
+        shell: bash
+        run: |
+          $PYTHON scripts/summarize_report.py "$REPORT_PATH" --log "$LOG_PATH" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the artifacts
+        id: publish
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          echo "shader_cache=$SHADER_CACHE_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the shader cache
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            out/${{ env.SHADER_CACHE_FILE }}
+            out/recompile-report.json
+            out/recompile.log
+          if-no-files-found: warn
+
+      - name: Upload the failed shaders
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-failed-shaders
+          path: out/failed-shaders
+          if-no-files-found: ignore
+
+      - name: Upload the recompiler
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XenosRecomp-${{ inputs.runner }}-${{ inputs.game_configuration }}
+          path: bin
+          if-no-files-found: warn
+
+      - name: Commit the shader cache
+        if: ${{ always() && inputs.commit_shader_cache == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          if [ ! -s "$CACHE_PATH" ]; then
+            echo "::warning title=Nothing to commit::The shader cache is empty, skipping the commit."
+            exit 0
+          fi
+
+          BRANCH="shader-cache/run-${{ github.run_id }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p shader-cache
+          cp "$CACHE_PATH" "shader-cache/$SHADER_CACHE_FILE"
+
+          if [ -f "$REPORT_PATH" ]; then
+            cp "$REPORT_PATH" shader-cache/recompile-report.json
+          fi
+
+          git checkout -b "$BRANCH"
+          git add shader-cache
+          git commit -m "Recompile shaders (${SHADER_ARCHIVE_URL})" || {
+            echo "Nothing changed, skipping."
+            exit 0
+          }
+          git push origin "$BRANCH"
+
+          gh pr create --title "Recompiled shader cache" \
+            --body "Shader cache generated by the \`Recompile Shaders\` workflow from ${SHADER_ARCHIVE_URL}." \
+            --head "$BRANCH" \
+            --base "${{ github.ref_name }}" \
+            || echo "::warning title=No pull request::The branch was pushed, but a pull request could not be created (GitHub Actions may not be allowed to create pull requests for this repository). Open one manually from the $BRANCH branch."

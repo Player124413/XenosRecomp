@@ -29,6 +29,11 @@ static constexpr const char* USAGE_TYPES[] =
     "float4", // FOG
     "float4", // DEPTH
     "float4", // SAMPLE
+
+    // Usages 14 and 15 do not exist, but the field is four bits wide. Shaders that use them are
+    // rejected when the name of the usage is looked up.
+    "float4",
+    "float4",
 };
 
 static constexpr const char* USAGE_VARIABLES[] =
@@ -128,6 +133,25 @@ static constexpr std::string_view TEXTURE_DIMENSIONS[] =
     "Cube" 
 };
 
+// The usage fields of vertex elements and interpolators are stored as four bit values, while the
+// tables below only describe the usages that are actually understood. Everything else is rejected
+// instead of reading past the end of the tables.
+static const char* usageVariable(DeclUsage usage)
+{
+    if (uint32_t(usage) >= std::size(USAGE_VARIABLES))
+        throw ShaderRecompileError(fmt::format("Shader uses an unknown vertex or interpolator usage {}.", uint32_t(usage)));
+
+    return USAGE_VARIABLES[uint32_t(usage)];
+}
+
+static const char* usageSemantic(DeclUsage usage)
+{
+    if (uint32_t(usage) >= std::size(USAGE_SEMANTICS))
+        throw ShaderRecompileError(fmt::format("Shader uses an unknown vertex or interpolator usage {}.", uint32_t(usage)));
+
+    return USAGE_SEMANTICS[uint32_t(usage)];
+}
+
 static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
 {
     return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
@@ -192,7 +216,12 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print("(float{})(", size);
 
     auto findResult = vertexElements.find(address);
-    assert(findResult != vertexElements.end());
+    if (findResult == vertexElements.end())
+    {
+        throw ShaderRecompileError(fmt::format(
+            "Vertex fetch at address {} refers to a vertex element that is not part of the vertex declaration.",
+            address));
+    }
 
     switch (findResult->second.usage)
     {
@@ -213,7 +242,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         break;
     }
 
-    print("(input.i{}{})", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
+    print("(input.i{}{})", usageVariable(findResult->second.usage), uint32_t(findResult->second.usageIndex));
 
     switch (findResult->second.usage)
     {
@@ -516,13 +545,24 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                     }
                     else
                     {
-                        assert(!instr.const0Relative && !instr.const1Relative);
+                        if (instr.const0Relative || instr.const1Relative)
+                        {
+                            throw ShaderRecompileError(fmt::format(
+                                "Dynamic constant indexing on '{}' (c{}), which is not declared as an array, is not supported.",
+                                constantName, reg));
+                        }
+
                         regFormatted = constantName;
                     }
                 }
                 else
                 {
-                    assert(!instr.const0Relative && !instr.const1Relative);
+                    if (instr.const0Relative || instr.const1Relative)
+                    {
+                        throw ShaderRecompileError(fmt::format(
+                            "Dynamic constant indexing on c{}, which is not present in the reflection data, is not supported.", reg));
+                    }
+
                     regFormatted = fmt::format("c{}", reg);
                 }
             }
@@ -673,7 +713,13 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             default:
             {
                 auto findResult = interpolators.find(instr.vectorDest);
-                assert(findResult != interpolators.end());
+                if (findResult == interpolators.end())
+                {
+                    throw ShaderRecompileError(fmt::format(
+                        "Export of register r{} has no matching vertex shader output interpolator.",
+                        uint32_t(instr.vectorDest)));
+                }
+
                 exportRegister = findResult->second;
                 break;
             }
@@ -1283,20 +1329,89 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 }
 
-void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
+// Shader containers are untrusted data: every offset stored in them is validated against the size
+// of the container before it is dereferenced, so that a corrupted or unsupported shader is reported
+// as failed instead of reading out of bounds.
+static bool isInBounds(size_t offset, size_t size, size_t total)
+{
+    return offset <= total && size <= total - offset;
+}
+
+static bool isNullTerminatedWithin(const uint8_t* data, size_t offset, size_t size)
+{
+    if (offset >= size)
+        return false;
+
+    for (size_t i = offset; i < size; i++)
+    {
+        if (data[i] == '\0')
+            return true;
+    }
+
+    return false;
+}
+
+void ShaderRecompiler::recompile(const uint8_t* shaderData, size_t shaderDataSize, const std::string_view& include)
 {
     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
 
-    assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
-    assert(shaderContainer->constantTableOffset != NULL);
+    if ((shaderContainer->flags & 0xFFFFFF00) != 0x102A1100)
+    {
+        throw ShaderRecompileError(fmt::format(
+            "Invalid shader container flags 0x{:X}.", shaderContainer->flags.get()));
+    }
+
+    const size_t containerSize = shaderDataSize;
+    const uint32_t virtualSize = shaderContainer->virtualSize.get();
+    const uint32_t physicalSize = shaderContainer->physicalSize.get();
+
+    if (!isInBounds(virtualSize, physicalSize, containerSize))
+    {
+        throw ShaderRecompileError("The shader container describes more data than it holds.");
+    }
+
+    if (shaderContainer->constantTableOffset == 0)
+    {
+        throw ShaderRecompileError("Shader container does not contain a constant table.");
+    }
 
     out += include;
     out += '\n';
 
     isPixelShader = (shaderContainer->flags & 0x1) == 0;
 
-    const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+    // Offsets stored inside the constant table are relative to the table itself.
+    const size_t constantTableDataOffset = size_t(shaderContainer->constantTableOffset.get()) + sizeof(be<uint32_t>);
+
+    if (!isInBounds(constantTableDataOffset, sizeof(ConstantTable), containerSize))
+    {
+        throw ShaderRecompileError("The constant table of this shader is out of bounds.");
+    }
+
+    const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset.get());
     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+
+    const size_t constantTableSize = containerSize - constantTableDataOffset;
+    const uint32_t numConstants = constantTableContainer->constantTable.constants.get();
+    const size_t constantInfoOffset = constantTableContainer->constantTable.constantInfo.get();
+
+    if (!isInBounds(constantInfoOffset, size_t(numConstants) * sizeof(ConstantInfo), constantTableSize))
+    {
+        throw ShaderRecompileError("The constant table of this shader is out of bounds.");
+    }
+
+    for (uint32_t i = 0; i < numConstants; i++)
+    {
+        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(constantTableData + constantInfoOffset + i * sizeof(ConstantInfo));
+
+        // Constant names are read as C strings in several places, so they have to be null
+        // terminated within the constant table.
+        if (!isNullTerminatedWithin(constantTableData, constantInfo->name.get(), constantTableSize))
+        {
+            throw ShaderRecompileError(fmt::format(
+                "Constant {} of this shader has an out of bounds name.", i));
+        }
+    }
 
     out += "#ifdef __spirv__\n\n";
 
@@ -1508,14 +1623,61 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         if (constantInfo->registerSet == RegisterSet::Bool)
         {
             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
-            println("#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
-            boolConstants.emplace(constantInfo->registerIndex, constantName);
+            const uint32_t registerCount = std::max<uint32_t>(constantInfo->registerCount.get(), 1);
+
+            for (uint32_t j = 0; j < registerCount; j++)
+            {
+                const uint32_t boolAddress = constantInfo->registerIndex.get() + j;
+                const uint32_t boolIndex = getPackedBooleanIndex(boolAddress, isPixelShader);
+
+                if (boolIndex >= PACKED_BOOLEAN_BITS)
+                {
+                    warnings.push_back(fmt::format(
+                        "Boolean constant '{}{}' uses register b{}, which is outside of the {}-bit packed boolean range "
+                        "supported by the shader common header.",
+                        constantName, registerCount > 1 ? fmt::format("[{}]", j) : "", boolAddress, PACKED_BOOLEAN_BITS));
+                    continue;
+                }
+
+                // Only the first element of a boolean array can be expressed as a macro.
+                // The remaining elements are still registered below so that conditional
+                // jumps referencing them resolve to the correct bit instead of producing
+                // an undeclared identifier.
+                if (j == 0)
+                    println("#define {} (1u << {})", constantName, boolIndex);
+
+                boolConstants.emplace(boolIndex, registerCount > 1 ? fmt::format("{}[{}]", constantName, j) : std::string(constantName));
+            }
         }
     }
 
     out += '\n';
 
-    const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
+    if (!isInBounds(shaderContainer->shaderOffset.get(), sizeof(Shader), containerSize))
+    {
+        throw ShaderRecompileError("The shader of this container is out of bounds.");
+    }
+
+    const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset.get());
+
+    // The vertex elements and interpolators are stored inline after the shader structure, so the
+    // amount of entries the shader claims to have has to fit into the container. Every read below
+    // then stays in bounds, as long as the indices used are the ones validated here.
+    uint32_t inlineDwords = (shader->interpolatorInfo.get() >> 5) & 0x1F;
+
+    if (!isPixelShader)
+    {
+        const auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
+        inlineDwords += vertexShader->field18.get() + vertexShader->vertexElementCount.get();
+    }
+
+    const size_t inlineOffset = size_t(shaderContainer->shaderOffset.get()) +
+        (isPixelShader ? sizeof(PixelShader) : sizeof(VertexShader));
+
+    if (!isInBounds(inlineOffset, size_t(inlineDwords) * sizeof(uint32_t), containerSize))
+    {
+        throw ShaderRecompileError("The interpolators and vertex elements of this shader are out of bounds.");
+    }
 
     println("struct {}", isPixelShader ? "Interpolators" : "VertexShaderInput");
     out += "{\n";
@@ -1527,14 +1689,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\tfloat4 iPos [[position]];\n";
 
         for (auto& [usage, usageIndex] : INTERPOLATORS)
-            println("\tfloat4 i{0}{1} [[user({2}{1})]];", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+            println("\tfloat4 i{0}{1} [[user({2}{1})]];", usageVariable(usage), usageIndex, usageSemantic(usage));
 
         out += "#else\n";
 
         out += "\tfloat4 iPos : SV_Position;\n";
 
         for (auto& [usage, usageIndex] : INTERPOLATORS)
-            println("\tfloat4 i{0}{1} : {2}{1};", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+            println("\tfloat4 i{0}{1} : {2}{1};", usageVariable(usage), usageIndex, usageSemantic(usage));
 
         out += "#endif\n";
     }
@@ -1566,7 +1728,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             out += '\t';
 
-            print("{0} i{1}{2}", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
+            print("{0} i{1}{2}", usageType, usageVariable(vertexElement.usage),
                 uint32_t(vertexElement.usageIndex));
 
             bool foundUsage = false;
@@ -1581,8 +1743,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             }
 
             if (!foundUsage) {
-                fmt::println("Missing mapping for vertex element usage: {} {}", USAGE_VARIABLES[uint32_t(vertexElement.usage)], uint32_t(vertexElement.usageIndex));
-                exit(1);
+                throw ShaderRecompileError(fmt::format(
+                    "Vertex element usage {} {} has no assigned location in USAGE_LOCATIONS.",
+                    usageVariable(vertexElement.usage), uint32_t(vertexElement.usageIndex)));
             }
 
             vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
@@ -1621,8 +1784,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 }
             }
 
-            println("{0} i{1}{2} : {3}{2};", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
-                uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
+            println("{0} i{1}{2} : {3}{2};", usageType, usageVariable(vertexElement.usage),
+                uint32_t(vertexElement.usageIndex), usageSemantic(vertexElement.usage));
         }
 
         out += "#endif\n";
@@ -1671,7 +1834,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\tfloat4 oPos [[position]] [[invariant]];\n";
 
         for (auto& [usage, usageIndex] : INTERPOLATORS)
-            print("\tfloat4 o{0}{1} [[user({2}{1})]];\n", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+            print("\tfloat4 o{0}{1} [[user({2}{1})]];\n", usageVariable(usage), usageIndex, usageSemantic(usage));
 
         out += "\tfloat clipDistance [[clip_distance]];\n";
 
@@ -1680,7 +1843,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\tprecise float4 oPos : SV_Position;\n";
 
         for (auto& [usage, usageIndex] : INTERPOLATORS)
-            print("\tfloat4 o{0}{1} : {2}{1};\n", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+            print("\tfloat4 o{0}{1} : {2}{1};\n", usageVariable(usage), usageIndex, usageSemantic(usage));
 
         out += "\tfloat clipDistance : SV_ClipDistance;\n";
 
@@ -1787,12 +1950,36 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     if (shaderContainer->definitionTableOffset != NULL)
     {
-        auto definitionTable = reinterpret_cast<const DefinitionTable*>(shaderData + shaderContainer->definitionTableOffset);
-        auto definitions = definitionTable->definitions;
-        while (*definitions != 0)
+        if (!isInBounds(shaderContainer->definitionTableOffset.get(), sizeof(DefinitionTable), containerSize))
         {
+            throw ShaderRecompileError("The definition table of this shader is out of bounds.");
+        }
+
+        auto definitionTable = reinterpret_cast<const DefinitionTable*>(shaderData + shaderContainer->definitionTableOffset.get());
+        auto definitions = definitionTable->definitions;
+
+        // The definition tables are null terminated lists of definitions, so the reads below are
+        // stopped at the end of the container instead of trusting the data to be well formed.
+        const auto definitionsInBounds = [&](const void* pointer, size_t size)
+        {
+            return isInBounds(size_t(reinterpret_cast<const uint8_t*>(pointer) - shaderData), size, containerSize);
+        };
+
+        while (true)
+        {
+            if (!definitionsInBounds(definitions, sizeof(uint32_t)))
+                throw ShaderRecompileError("The definition table of this shader is truncated.");
+
+            if (*definitions == 0)
+                break;
+
             auto definition = reinterpret_cast<const Float4Definition*>(definitions);
-            auto value = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + definition->physicalOffset);
+
+            if (!definitionsInBounds(definition, sizeof(Float4Definition)) ||
+                !isInBounds(definition->physicalOffset.get(), size_t((definition->count.get() + 3) / 4) * 16, physicalSize))
+                throw ShaderRecompileError("The definition table of this shader is out of bounds.");
+
+            auto value = reinterpret_cast<const be<uint32_t>*>(shaderData + virtualSize + definition->physicalOffset.get());
             for (uint16_t i = 0; i < (definition->count + 3) / 4; i++)
             {
                 println("#ifdef __air__");
@@ -1808,9 +1995,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             definitions += 2;
         }
         ++definitions;
-        while (*definitions != 0)
+
+        while (true)
         {
+            if (!definitionsInBounds(definitions, sizeof(uint32_t)))
+                throw ShaderRecompileError("The definition table of this shader is truncated.");
+
+            if (*definitions == 0)
+                break;
+
             auto definition = reinterpret_cast<const Int4Definition*>(definitions);
+
+            if (!definitionsInBounds(definition, sizeof(Int4Definition)) ||
+                !definitionsInBounds(definition->values, size_t(definition->count.get()) * sizeof(be<uint32_t>)))
+                throw ShaderRecompileError("The definition table of this shader is out of bounds.");
+
             for (uint16_t i = 0; i < definition->count; i++)
             {
                 union
@@ -1852,14 +2051,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         if (isPixelShader)
         {
             value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
-            println("\tfloat4 r{} = input.i{}{};", uint32_t(interpolator.reg), USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
+            println("\tfloat4 r{} = input.i{}{};", uint32_t(interpolator.reg), usageVariable(interpolator.usage), uint32_t(interpolator.usageIndex));
             printedRegisters[interpolator.reg] = true;
         }
         else
         {
             auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
-            interpolators.emplace(i, fmt::format("output.o{}{}", USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex)));
+            interpolators.emplace(i, fmt::format("output.o{}{}", usageVariable(interpolator.usage), uint32_t(interpolator.usageIndex)));
         }
     }
 
@@ -1871,7 +2070,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     #endif
 
         for (auto& [usage, usageIndex] : INTERPOLATORS)
-            println("\toutput.o{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
+            println("\toutput.o{}{} = 0.0;", usageVariable(usage), usageIndex);
 
         out += "\n";
     }
@@ -1929,7 +2128,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 #endif
     }
 
-    const be<uint32_t>* code = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset);
+    // The microcode of the shader lives in the physical area of the container.
+    if (!isInBounds(shader->physicalOffset.get(), shader->size.get(), physicalSize))
+    {
+        throw ShaderRecompileError("The microcode of this shader is out of bounds.");
+    }
+
+    const be<uint32_t>* code = reinterpret_cast<const be<uint32_t>*>(shaderData + virtualSize + shader->physicalOffset.get());
 
     union
     {
@@ -1947,6 +2152,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     uint32_t instrAddress = 0;
     uint32_t instrSize = shader->size;
     bool simpleControlFlow = true;
+
+    // Unsupported or approximated control flow constructs are collected here so that they
+    // end up in the recompilation report instead of silently affecting the generated shader.
+    std::set<uint32_t> conditionalExecRegisters;
+    bool hasFunctionCalls = false;
 
     while (instrAddress < instrSize)
     {
@@ -1971,11 +2181,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             case ControlFlowOpcode::CondExecPredClean:
             case ControlFlowOpcode::CondExecPredCleanEnd:
                 address = cfInstr.condExec.address;
+                conditionalExecRegisters.insert(cfInstr.condExec.boolAddress);
                 break;
 
             case ControlFlowOpcode::CondExecPred:
             case ControlFlowOpcode::CondExecPredEnd:
                 address = cfInstr.condExecPred.address;
+                break;
+
+            case ControlFlowOpcode::CondCall:
+            case ControlFlowOpcode::Return:
+                hasFunctionCalls = true;
                 break;
 
             case ControlFlowOpcode::CondJmp:
@@ -1995,6 +2211,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         controlFlowCode += 3;
         instrAddress += 12;
+    }
+
+    if (!conditionalExecRegisters.empty())
+    {
+        std::string registers;
+        size_t count = 0;
+
+        for (uint32_t boolAddress : conditionalExecRegisters)
+        {
+            if (count++ == 8)
+            {
+                registers += ", ...";
+                break;
+            }
+
+            registers += fmt::format("{}b{} (packed bit {})", registers.empty() ? "" : ", ", boolAddress,
+                getPackedBooleanIndex(boolAddress, isPixelShader));
+        }
+
+        warnings.push_back(fmt::format(
+            "Shader conditionally executes instructions based on boolean constants ({}). These blocks are "
+            "currently translated as unconditional blocks, which can produce incorrect results.",
+            registers));
+    }
+
+    if (hasFunctionCalls)
+    {
+        warnings.push_back("Shader contains function calls (condcall/return), which are not translated. "
+            "The resulting shader may be incomplete.");
     }
 
     if (simpleControlFlow)
@@ -2118,7 +2363,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 if (cfInstr.condJmp.isUnconditional)
                 {
-                    assert(!simpleControlFlow);
+                    // Unconditional jumps switch the shader over to the switch based control flow
+                    // mode above, which is what makes the "continue" below valid.
                     println("\t\t\tpc = {};", uint32_t(cfInstr.condJmp.address));
                     out += "\t\t\tcontinue;\n";
                 }
@@ -2131,12 +2377,32 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     }
                     else
                     {
-                        auto findResult = boolConstants.find(cfInstr.condJmp.boolAddress);
-                        if (findResult != boolConstants.end())
-                            println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                        // The condition is read straight from the packed boolean value instead of
+                        // referencing the constant table name. Shaders may jump on boolean registers
+                        // that are not present in the reflection data (or that are reflected with a
+                        // different register index), which previously produced references to
+                        // undeclared identifiers such as b128/b129/b130.
+                        const uint32_t boolAddress = cfInstr.condJmp.boolAddress;
+                        const uint32_t boolIndex = getPackedBooleanIndex(boolAddress, isPixelShader);
+                        const char* comparison = (cfInstr.condJmp.condition ^ simpleControlFlow) ? "!=" : "==";
+
+                        if (boolIndex < PACKED_BOOLEAN_BITS)
+                        {
+                            auto findResult = boolConstants.find(boolIndex);
+                            if (findResult != boolConstants.end())
+                                println("if ((g_Booleans & (1u << {})) {} 0) // {} (b{})", boolIndex, comparison, findResult->second, boolAddress);
+                            else
+                                println("if ((g_Booleans & (1u << {})) {} 0) // b{} (boolean constant not in reflection data)", boolIndex, comparison, boolAddress);
+                        }
                         else
-                            println("if ({})", cfInstr.condJmp.condition ^ simpleControlFlow ? "false" : "true"); 
-                        // println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                        {
+                            warnings.push_back(fmt::format(
+                                "Conditional jump on boolean register b{} is outside of the {}-bit packed boolean range "
+                                "supported by the shader common header and is always treated as false.",
+                                boolAddress, PACKED_BOOLEAN_BITS));
+
+                            println("if ({}) // b{} is outside of the supported packed boolean range", (comparison == "!=") ? "false" : "true", boolAddress);
+                        }
                     }
 
                     if (simpleControlFlow)
@@ -2156,6 +2422,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 break;
             }
             }
+
+            // Instruction addresses and counts come from the shader data as well.
+            if (!isInBounds(size_t(address) * 12, size_t(count) * 12, size_t(shader->size.get())))
+                throw ShaderRecompileError(fmt::format("Shader instruction block at {} is out of bounds.", address));
 
             auto instructionCode = code + address * 3;
             

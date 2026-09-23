@@ -115,6 +115,42 @@ At runtime, shaders are mapped to their recompiled versions using a 64-bit XXH3 
 
 SPIR-V shaders are compressed using smol-v to improve zstd compression efficiency, while DXIL shaders are compressed as-is.
 
+### Options
+
+The recompiler continues with the remaining shaders when a single shader cannot be translated, and reports every failure with the compiler errors and the generated HLSL:
+
+```
+XenosRecomp [input path] [output path] [header file path] [options]
+
+  --report <path>          Write a JSON report of the recompilation to the given path.
+  --dump-failed <dir>      Write the generated HLSL of failed shaders into the given directory.
+  --allow-failures         Do not return an error code when shaders fail to compile.
+  --jobs <count>           Number of shaders to recompile in parallel.
+  --help                   Show this message.
+```
+
+The report lists every shader that failed or produced a warning together with its hash, path, stage and the generated diagnostics, so that a build can publish it as an artifact instead of stopping at the first error.
+
+### Recompiling Shaders with GitHub Actions
+
+The `Recompile Shaders` workflow recompiles a set of shaders on GitHub's runners. Open it from the `Actions` tab, press `Run workflow` and paste a link to an archive with the shader files (`.zip`, Google Drive, MediaFire or GitHub release links all work) before running it. Nested archives, such as the shader `.ar` file stored inside a zip, are extracted automatically.
+
+The workflow builds the recompiler, runs the self-tests, recompiles every shader found in the archive and uploads these artifacts:
+
+* the shader cache (`shader_cache.cpp` by default) and the JSON report,
+* the generated HLSL of every failed shader together with the compiler errors,
+* the recompiler itself, in case it is needed for a local run.
+
+The job summary lists the number of recompiled and failed shaders, the failing shaders and all warnings. `windows-latest` is the default runner because it is the only platform where the DirectX Shader Compiler can sign the generated DXIL; shader caches built on other platforms may be rejected by the driver at runtime.
+
+### Self-Tests
+
+`tests/run_tests.py` builds a set of shader containers with `tests/make_test_shaders.py`, recompiles them with a built `XenosRecomp` and checks the results, including the packed boolean constant handling, the JSON report and the handling of corrupted shader containers:
+
+```
+python3 tests/run_tests.py --tool <path to XenosRecomp> [--include <shader_common.h>]
+```
+
 ## Building
 
 The project requires CMake 3.20 and a C++ compiler with C++17 support to build. While compilers other than Clang might work, they have not been tested. Since the repository includes submodules, ensure you clone it recursively.
