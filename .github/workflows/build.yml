@@ -24,60 +24,102 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            preset: "Visual Studio 17 2022"
             dxil: "ON"
           - os: ubuntu-latest
-            preset: ""
             dxil: "ON"
           - os: macos-latest
-            preset: ""
             dxil: "ON"
           # Shader caches for Vulkan do not need DXIL at all, which is what a Vulkan only
           # port builds.
           - os: ubuntu-latest
-            preset: ""
             dxil: "OFF"
 
-    env:
-      PYTHON: ${{ matrix.os == 'windows-latest' && 'python' || 'python3' }}
-
     steps:
+      - name: Select the Python executable
+        shell: bash
+        run: |
+          if command -v python >/dev/null 2>&1; then
+            echo "PYTHON=python" >> "$GITHUB_ENV"
+          else
+            echo "PYTHON=python3" >> "$GITHUB_ENV"
+          fi
+
       - name: Check out the recompiler
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Configure
+      - name: Configure and build
         shell: bash
         run: |
           set -e
 
-          # Only Windows builds load the validation library, which is what signs the shaders
-          # for the driver, but the DXIL code path itself is compiled on every platform.
-          CMAKE_ARGS="-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$GITHUB_WORKSPACE/bin -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-          CMAKE_ARGS="$CMAKE_ARGS -DXENOS_RECOMP_DXIL=${{ matrix.dxil }} -DXENOS_RECOMP_SPIRV=ON"
+          echo "Building on ${RUNNER_OS:-unknown} with $(cmake --version | head -n 1)"
 
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cmake -B build -G "${{ matrix.preset }}" -A x64 $CMAKE_ARGS
+          # Only Windows builds load the validation library, which is what signs the shaders for
+          # the driver, but the DXIL code path itself is compiled on every platform.
+          CMAKE_ARGS=(-DCMAKE_POLICY_VERSION_MINIMUM=3.5)
+          CMAKE_ARGS+=(-DXENOS_RECOMP_DXIL="${{ matrix.dxil }}" -DXENOS_RECOMP_SPIRV=ON)
+
+          # The generator follows the machine the job runs on, so that no Visual Studio generator
+          # is requested on a machine without Visual Studio.
+          if [ "${RUNNER_OS:-unknown}" = "Windows" ]; then
+            GENERATORS=("Visual Studio 17 2022" "Visual Studio 16 2019" "Visual Studio 15 2017")
           else
-            cmake -B build -DCMAKE_BUILD_TYPE=Release $CMAKE_ARGS
+            GENERATORS=("")
           fi
 
-      - name: Build
-        shell: bash
-        run: |
-          set -e
+          built=0
 
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cmake --build build --config RelWithDebInfo --parallel
-          else
-            cmake --build build --parallel
+          for generator in "${GENERATORS[@]}"; do
+            if [ -n "$generator" ]; then
+              echo "Configuring with the '$generator' generator..."
+              CONFIGURE_ARGS=(-G "$generator" -A x64)
+              BUILD_ARGS=(--config RelWithDebInfo)
+            else
+              echo "Configuring with the default generator..."
+              CONFIGURE_ARGS=(-DCMAKE_BUILD_TYPE=Release)
+              BUILD_ARGS=()
+            fi
+
+            rm -rf build
+
+            if cmake -B build "${CONFIGURE_ARGS[@]}" "${CMAKE_ARGS[@]}" && cmake --build build "${BUILD_ARGS[@]}" --parallel; then
+              built=1
+              break
+            fi
+          done
+
+          if [ "$built" != "1" ]; then
+            echo "::error title=Build failed::CMake could not configure a build on this machine (${RUNNER_OS:-unknown}, runner '${{ matrix.os }}')."
+            echo ""
+            echo "The generators that are available here are:"
+            cmake --help | sed -n '/^Generators/,$p' | head -n 40
+            exit 1
           fi
+
+          TOOL=$(find build -type f \( -name "XenosRecomp" -o -name "XenosRecomp.exe" \) | head -n 1)
+
+          if [ -z "$TOOL" ]; then
+            echo "::error title=Build failed::XenosRecomp was not built."
+            exit 1
+          fi
+
+          mkdir -p bin
+          cp "$TOOL" bin/
+          chmod +x "bin/$(basename "$TOOL")" || true
+
+          echo "Built $TOOL"
 
       - name: Test
         shell: bash
         run: |
           set -e
           TOOL=$(find bin -type f \( -name "XenosRecomp" -o -name "XenosRecomp.exe" \) | head -n 1)
-          chmod +x "$TOOL" || true
+
+          if [ -z "$TOOL" ]; then
+            echo "::error title=Test failed::XenosRecomp was not built."
+            exit 1
+          fi
+
           $PYTHON tests/run_tests.py --tool "$TOOL" --include XenosRecomp/shader_common.h
