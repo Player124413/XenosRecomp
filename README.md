@@ -119,6 +119,23 @@ Files that are compressed with the Xbox 360 file compression (`XMemCompress`, ma
 
 SPIR-V shaders are compressed using smol-v to improve zstd compression efficiency, while DXIL shaders are compressed as-is.
 
+### Graphics APIs
+
+Every shader is compiled to DXIL for Direct3D 12 and to SPIR-V for Vulkan. A game that only renders
+with one of the two APIs does not need the shaders of the other one, so the shader cache can be
+generated for a single API:
+
+```
+XenosRecomp [input path] [output path] [header file path] --api vulkan
+```
+
+`--api vulkan` only compiles SPIR-V (the cache is roughly half the size and no DXIL data at all is
+written), `--api d3d12` only compiles DXIL and `--api both` is the default. The backends themselves
+can be turned off at configure time with `-DXENOS_RECOMP_DXIL=OFF` and `-DXENOS_RECOMP_SPIRV=OFF`,
+which skips linking the DXIL validation library and removes the data from the generated cache. A
+recompiler built that way recompiles for the API it supports when `--api` is not given, and reports
+an error when an API that was turned off is asked for explicitly.
+
 ### Options
 
 The recompiler continues with the remaining shaders when a single shader cannot be translated, and reports every failure with the compiler errors and the generated HLSL:
@@ -126,6 +143,8 @@ The recompiler continues with the remaining shaders when a single shader cannot 
 ```
 XenosRecomp [input path] [output path] [header file path] [options]
 
+  --api <both|vulkan|d3d12>
+                           Graphics API to generate the shader cache for.
   --report <path>          Write a JSON report of the recompilation to the given path.
   --dump-failed <dir>      Write the generated HLSL of failed shaders into the given directory.
   --allow-failures         Do not return an error code when shaders fail to compile.
@@ -141,11 +160,15 @@ The `Recompile Shaders` workflow recompiles a set of shaders on GitHub's runners
 
 The archive may hold the game files in any form the recompiler understands: plain shader containers, compressed files (`.ar`, `.ar.00`, `.ar.01`), or a mix of both. Files that only hold the index of an archive, such as the `.arl` files next to the shader archives of a Sonic game, are unpacked as well and simply do not contain any shaders.
 
+The `graphics_api` input selects what the shaders are compiled to: `vulkan` only compiles SPIR-V (the right choice for a Vulkan only port, and the generated cache is roughly half the size of a cache that holds both APIs), `d3d12` only compiles DXIL, and `both` is the default. Choosing `vulkan` also means the run does not need a Windows runner, because SPIR-V is compiled by DXC on every platform, while DXIL blobs can only be signed on Windows.
+
 The workflow builds the recompiler, runs the self-tests, recompiles every shader found in the archive and uploads these artifacts:
 
 * the shader cache (`shader_cache.cpp` by default) and the JSON report,
 * the generated HLSL of every failed shader together with the compiler errors,
 * the recompiler itself, in case it is needed for a local run.
+
+The generated `shader_cache.cpp` contains the data of the selected API only, so the `shader_cache.h` of the game has to be built for the same one (for example, a cache that only holds SPIR-V cannot be used by a Direct3D 12 build of the game).
 
 The job summary lists the number of recompiled and failed shaders, the failing shaders and all warnings. `windows-latest` is the default runner because it is the only platform where the DirectX Shader Compiler can sign the generated DXIL; shader caches built on other platforms may be rejected by the driver at runtime.
 

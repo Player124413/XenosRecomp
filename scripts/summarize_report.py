@@ -85,6 +85,8 @@ def main():
 
     print("## Shader recompilation")
     print()
+    api = report.get("graphicsApi", "both")
+
     print("| Shaders | Count |")
     print("| --- | --- |")
     print("| Total | {} |".format(total))
@@ -97,6 +99,13 @@ def main():
     if compressed:
         print("| Xbox 360 compressed files decoded | {} |".format(compressed))
 
+    print()
+    if api == "both":
+        print("Graphics API: **both** (DXIL for Direct3D 12 and SPIR-V for Vulkan)")
+    elif api == "vulkan":
+        print("Graphics API: **vulkan** (this cache only holds SPIR-V)")
+    else:
+        print("Graphics API: **d3d12** (this cache only holds DXIL)")
     print()
 
     if failed == 0:

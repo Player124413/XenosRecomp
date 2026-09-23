@@ -3,6 +3,11 @@ name: Recompile Shaders
 # Paste a link to an archive with the game's shader files, press "Run workflow", and
 # download the recompiled shader cache from the artifacts of the run.
 #
+# The graphics API input selects what the shaders are compiled to: "vulkan" only compiles
+# SPIR-V, "d3d12" only DXIL and "both" compiles each shader twice. A cache that only holds
+# SPIR-V is half the size and is the right choice for a Vulkan only port, while "d3d12" needs
+# the windows-latest runner to sign the DXIL blobs.
+#
 # The workflow works with direct links to .zip/.7z/.rar files, Google Drive links,
 # MediaFire links and GitHub release assets. Archives inside the archive (for example
 # the shader .ar file stored inside a zip) are extracted automatically, and the shader
@@ -25,6 +30,15 @@ on:
           - windows-latest
           - ubuntu-latest
           - macos-latest
+      graphics_api:
+        description: "Graphics API to recompile the shaders for. Vulkan only compiles SPIR-V, Direct3D 12 only DXIL."
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - vulkan
+          - d3d12
       game_configuration:
         description: "Game specific recompiler code to build with"
         required: true
@@ -65,6 +79,11 @@ on:
       runner:
         required: false
         default: windows-latest
+        type: string
+      graphics_api:
+        description: "Graphics API to recompile the shaders for (both, vulkan or d3d12)"
+        required: false
+        default: both
         type: string
       game_configuration:
         required: false
@@ -114,6 +133,7 @@ jobs:
     env:
       PYTHON: ${{ inputs.runner == 'windows-latest' && 'python' || 'python3' }}
       SHADER_ARCHIVE_URL: ${{ inputs.shader_archive_url }}
+      GRAPHICS_API: ${{ inputs.graphics_api }}
       GAME_CONFIGURATION: ${{ inputs.game_configuration }}
       SHADER_COMMON_HEADER_URL: ${{ inputs.shader_common_header_url }}
       SHADER_CACHE_FILE: ${{ inputs.shader_cache_file }}
@@ -146,6 +166,36 @@ jobs:
           echo "LOG_PATH=$GITHUB_WORKSPACE/out/recompile.log" >> "$GITHUB_ENV"
           echo "BUILD_DEFINES=${GAME_CONFIGURATION/none/}" >> "$GITHUB_ENV"
 
+          case "$GRAPHICS_API" in
+            both)
+              DXIL=ON
+              SPIRV=ON
+              ;;
+            vulkan)
+              # A Vulkan shader cache does not need DXIL at all, so the DXIL cache is left out
+              # of the generated file.
+              DXIL=OFF
+              SPIRV=ON
+              ;;
+            d3d12)
+              DXIL=ON
+              SPIRV=OFF
+              ;;
+            *)
+              echo "::error title=Invalid graphics API::'$GRAPHICS_API' is not supported. Use 'both', 'vulkan' or 'd3d12'."
+              exit 1
+              ;;
+          esac
+
+          if [ "$GRAPHICS_API" = "d3d12" ] && [ "${{ inputs.runner }}" != "windows-latest" ]; then
+            echo "::warning title=DXIL cannot be signed::Only Windows runners can sign the generated DXIL, the driver may reject the shaders at runtime."
+          fi
+
+          echo "GRAPHICS_API=$GRAPHICS_API" >> "$GITHUB_ENV"
+          echo "XENOS_RECOMP_DXIL=$DXIL" >> "$GITHUB_ENV"
+          echo "XENOS_RECOMP_SPIRV=$SPIRV" >> "$GITHUB_ENV"
+          echo "Recompiling for the $GRAPHICS_API graphics API (DXIL: $DXIL, SPIR-V: $SPIRV)"
+
       - name: Set up the compiler cache
         uses: actions/cache@v4
         with:
@@ -159,7 +209,9 @@ jobs:
         run: |
           set -e
 
-          CMAKE_ARGS="-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$GITHUB_WORKSPACE/bin -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DXENOS_RECOMP_EXTRA_DEFINES=$BUILD_DEFINES"
+          CMAKE_ARGS="-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$GITHUB_WORKSPACE/bin -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+          CMAKE_ARGS="$CMAKE_ARGS -DXENOS_RECOMP_EXTRA_DEFINES=$BUILD_DEFINES"
+          CMAKE_ARGS="$CMAKE_ARGS -DXENOS_RECOMP_DXIL=$XENOS_RECOMP_DXIL -DXENOS_RECOMP_SPIRV=$XENOS_RECOMP_SPIRV"
 
           if [ "${{ inputs.runner }}" = "windows-latest" ]; then
             cmake -B build -G "Visual Studio 17 2022" -A x64 $CMAKE_ARGS
@@ -224,6 +276,7 @@ jobs:
 
           set +e
           "$TOOL" "$SHADER_EXTRACT_DIR" "$CACHE_PATH" "$SHADER_COMMON_HEADER" \
+            --api "$GRAPHICS_API" \
             --report "$REPORT_PATH" \
             --dump-failed "$FAILED_DIR" \
             $FAILURE_ARG 2>&1 | tee "$LOG_PATH"
@@ -235,7 +288,7 @@ jobs:
           if [ -s "$CACHE_PATH" ]; then
             echo "### Shader cache" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Generated \`$SHADER_CACHE_FILE\` ($(du -h "$CACHE_PATH" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
+            echo "Generated \`$SHADER_CACHE_FILE\` for the $GRAPHICS_API graphics API ($(du -h "$CACHE_PATH" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "$STATUS" != "0" ]; then

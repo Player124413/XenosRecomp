@@ -7,7 +7,8 @@ boolean constant registers such as b128/b129, which used to be emitted as refere
 identifiers that were never declared.
 
 The generated Xbox 360 compressed archives are tested as well, because the shaders of a
-game are stored in them as "shader.ar.00" and "shader.ar.01" files.
+game are stored in them as "shader.ar.00" and "shader.ar.01" files, and a shader cache is
+generated for a single graphics API on top of the full run.
 
 Usage:
     run_tests.py --tool <path to XenosRecomp> [--include <shader_common.h>] [--work-dir <dir>]
@@ -309,6 +310,71 @@ def test_archives(tool, include, work_directory, archives):
     return failures
 
 
+def test_graphics_apis(tool, include, work_directory, expected):
+    """Checks that a shader cache can be generated for a single graphics API.
+
+    '--api vulkan' has to produce SPIR-V only and '--api d3d12' DXIL only, which halves the
+    size of the generated cache. Recompilers that were built without one of the two backends
+    skip the corresponding check.
+    """
+    failures = 0
+    source_directory = os.path.join(work_directory, "api-source")
+    os.makedirs(source_directory, exist_ok=True)
+
+    for entry in expected:
+        shutil.copyfile(os.path.join(work_directory, entry["file"]),
+                        os.path.join(source_directory, entry["file"]))
+
+    checks = (
+        ("vulkan", "g_compressedSpirvCache", "g_dxilCacheDecompressedSize"),
+        ("d3d12", "g_compressedDxilCache", "g_spirvCacheDecompressedSize"),
+    )
+
+    for api, expectedArray, otherSize in checks:
+        cache_path = os.path.join(work_directory, "api-" + api, "shader_cache.cpp")
+        report_path = os.path.join(work_directory, "api-" + api, "report.json")
+
+        try:
+            code, output = run_tool([tool, source_directory, cache_path, include, "--api", api,
+                                     "--report", report_path], expect_success=False)
+
+            if code != 0 and "was built without" in output:
+                print("  skip shader cache for {} (the recompiler was built without it)".format(api))
+                continue
+
+            check(code == 0, "generating a {} shader cache exited with {}:\n{}".format(api, code, output[-2000:]))
+
+            with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
+                cache = f.read()
+
+            check(expectedArray in cache, "the {} shader cache does not contain {}".format(api, expectedArray))
+
+            with open(report_path, "r", encoding="utf-8") as f:
+                report = json.load(f)
+
+            check(report["graphicsApi"] == api,
+                  "the report says the cache was generated for '{}' instead of '{}'".format(
+                      report.get("graphicsApi"), api))
+            check(report["failedShaders"] == 0, "{} shader(s) failed to recompile for {}".format(
+                report["failedShaders"], api))
+            check(report["totalShaders"] > 0, "no shader was recompiled for {}".format(api))
+
+            # The data of the other API has to be left out of the cache, otherwise the file is
+            # not smaller than a cache that holds both.
+            match = re.search(re.escape(otherSize) + r" = (\d+);", cache)
+
+            if match is not None:
+                check(match.group(1) == "0",
+                      "the {} shader cache holds {} bytes of data for the other API".format(api, match.group(1)))
+
+            print("  ok   shader cache for {}".format(api))
+        except (TestFailure, OSError, ValueError) as error:
+            failures += 1
+            print("  FAIL shader cache for {}: {}".format(api, error))
+
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tool", required=True, help="Path to the XenosRecomp executable")
@@ -330,6 +396,7 @@ def main():
     failures += test_shader_cache(args.tool, include, work_directory, expected)
     failures += test_unresolvable_shaders(args.tool, include, work_directory)
     failures += test_corrupted_shaders(args.tool, include, work_directory)
+    failures += test_graphics_apis(args.tool, include, work_directory, expected)
     failures += test_archives(args.tool, include, work_directory, make_test_shaders.write_archives(
         work_directory, open(os.path.join(work_directory, "ps_bool129.bin"), "rb").read(),
         open(os.path.join(work_directory, "vs_bool5.bin"), "rb").read()))

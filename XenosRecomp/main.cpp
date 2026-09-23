@@ -205,6 +205,43 @@ static ArchiveName splitArchiveName(const std::filesystem::path& path)
     return result;
 }
 
+// The graphics API a shader cache is generated for. Recompiling for a single API skips the work
+// for the other one, which halves the time a run takes and removes the data the game does not use
+// from the generated cache.
+enum class GraphicsApi
+{
+    Both,
+    Vulkan,
+    Direct3D12
+};
+
+static const char* graphicsApiName(GraphicsApi api)
+{
+    switch (api)
+    {
+    case GraphicsApi::Vulkan: return "vulkan";
+    case GraphicsApi::Direct3D12: return "d3d12";
+    default: return "both";
+    }
+}
+
+static bool wantsVulkan(GraphicsApi api)
+{
+    return api == GraphicsApi::Both || api == GraphicsApi::Vulkan;
+}
+
+static bool wantsDirect3D12(GraphicsApi api)
+{
+    return api == GraphicsApi::Both || api == GraphicsApi::Direct3D12;
+}
+
+// Metal shaders are used by macOS builds, which is a third backend next to DXIL and SPIR-V, so
+// they are only compiled for 'both'.
+static bool wantsAir(GraphicsApi api)
+{
+    return api == GraphicsApi::Both;
+}
+
 struct Options
 {
     std::string input;
@@ -214,6 +251,8 @@ struct Options
     std::string dumpFailedShaders;
     bool allowFailures = false;
     uint32_t threadCount = 0; // 0 = use the number of available hardware threads
+    GraphicsApi api = GraphicsApi::Both;
+    bool apiWasGiven = false;
 };
 
 static void printUsage()
@@ -232,6 +271,11 @@ static void printUsage()
         "  --allow-failures         Do not return an error code when shaders fail to compile.\n"
         "  --jobs <count>           Number of shaders to recompile in parallel. Defaults to the\n"
         "                           number of available hardware threads.\n"
+        "  --api <both|vulkan|d3d12>\n"
+        "                           Graphics API to generate the shader cache for. 'both' compiles\n"
+        "                           the shaders to DXIL and SPIR-V, 'vulkan' only to SPIR-V and\n"
+        "                           'd3d12' only to DXIL. Metal shaders are only generated\n"
+        "                           for 'both'.\n"
         "  --help                   Show this message.");
 }
 
@@ -273,6 +317,27 @@ static bool parseArgs(int argc, char** argv, Options& options)
         else if (arg == "--allow-failures" || arg == "--continue-on-error")
         {
             options.allowFailures = true;
+        }
+        else if (arg == "--api" || arg == "--graphics-api")
+        {
+            std::string value = readValue(i, "--api");
+
+            if (value.empty())
+                return false;
+
+            if (value == "both")
+                options.api = GraphicsApi::Both;
+            else if (value == "vulkan" || value == "vulkan-only")
+                options.api = GraphicsApi::Vulkan;
+            else if (value == "d3d12" || value == "dxil" || value == "d3d12-only")
+                options.api = GraphicsApi::Direct3D12;
+            else
+            {
+                logError(fmt::format("'{}' is not a supported graphics API. Use 'both', 'vulkan' or 'd3d12'.", value));
+                return false;
+            }
+
+            options.apiWasGiven = true;
         }
         else if (arg == "--jobs" || arg == "-j")
         {
@@ -339,6 +404,32 @@ static bool parseArgs(int argc, char** argv, Options& options)
         return false;
     }
 
+    // The graphics API is only compiled for what the build supports, so 'both' is not an error when
+    // one of the backends was turned off at configure time. An API that was asked for explicitly is.
+#ifndef XENOS_RECOMP_DXIL
+    if (options.apiWasGiven && wantsDirect3D12(options.api))
+    {
+        logError("This recompiler was built without Direct3D 12 support, so shader caches cannot be "
+            "generated for it. Reconfigure the build with -DXENOS_RECOMP_DXIL=ON, or pass '--api vulkan'.");
+        return false;
+    }
+
+    if (options.api == GraphicsApi::Both)
+        options.api = GraphicsApi::Vulkan;
+#endif
+
+#ifndef XENOS_RECOMP_SPIRV
+    if (options.apiWasGiven && wantsVulkan(options.api))
+    {
+        logError("This recompiler was built without Vulkan support, so shader caches cannot be "
+            "generated for it. Reconfigure the build with -DXENOS_RECOMP_SPIRV=ON, or pass '--api d3d12'.");
+        return false;
+    }
+
+    if (options.api == GraphicsApi::Both)
+        options.api = GraphicsApi::Direct3D12;
+#endif
+
     return true;
 }
 
@@ -398,7 +489,7 @@ static void printProgress(std::atomic<uint32_t>& progress, uint32_t numShaders)
 }
 
 static void recompileShader(const ShaderJob& job, ShaderResult& result, RecompiledShader& shader, const std::string_view include,
-    std::atomic<uint32_t>& progress, uint32_t numShaders)
+    GraphicsApi api, std::atomic<uint32_t>& progress, uint32_t numShaders)
 {
     thread_local ShaderRecompiler recompiler;
     recompiler = {};
@@ -429,71 +520,93 @@ static void recompileShader(const ShaderJob& job, ShaderResult& result, Recompil
     result.isPixelShader = recompiler.isPixelShader;
     result.warnings = std::move(recompiler.warnings);
 
+#if defined(XENOS_RECOMP_DXIL) || defined(XENOS_RECOMP_SPIRV)
     thread_local DxcCompiler dxcCompiler;
-
-    if (!dxcCompiler.isValid())
-    {
-        result.errors.emplace_back("The DirectX Shader Compiler is not available, so the shader could not be compiled.");
-        result.hlsl = std::move(recompiler.out);
-        printProgress(progress, numShaders);
-        return;
-    }
+#endif
 
     shader.specConstantsMask = recompiler.specConstantsMask;
 
 #ifdef XENOS_RECOMP_DXIL
-    DxcCompileResult dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false,
-        job.displayName(recompiler.isPixelShader) + " [DXIL]");
-
-    if (!dxil.succeeded())
+    if (wantsDirect3D12(api))
     {
-        result.errors.emplace_back(fmt::format("Failed to compile the recompiled shader to DXIL:\n{}", indentLines(dxil.errors)));
-        result.hlsl = std::move(recompiler.out);
-        printProgress(progress, numShaders);
-        return;
+        if (!dxcCompiler.isValid())
+        {
+            result.errors.emplace_back("The DirectX Shader Compiler is not available, so the shader could not be compiled.");
+            result.hlsl = std::move(recompiler.out);
+            printProgress(progress, numShaders);
+            return;
+        }
+
+        DxcCompileResult dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false,
+            job.displayName(recompiler.isPixelShader) + " [DXIL]");
+
+        if (!dxil.succeeded())
+        {
+            result.errors.emplace_back(fmt::format("Failed to compile the recompiled shader to DXIL:\n{}", indentLines(dxil.errors)));
+            result.hlsl = std::move(recompiler.out);
+            printProgress(progress, numShaders);
+            return;
+        }
+
+        shader.dxil = dxil.object;
+
+        if (*(reinterpret_cast<uint32_t*>(shader.dxil->GetBufferPointer()) + 1) == 0)
+            g_unsignedDxil = true;
     }
-
-    shader.dxil = dxil.object;
-
-    if (*(reinterpret_cast<uint32_t*>(shader.dxil->GetBufferPointer()) + 1) == 0)
-        g_unsignedDxil = true;
 #endif
 
 #ifdef XENOS_RECOMP_AIR
-    try
+    // AIR is a third backend of its own, so it is only generated for the default 'both' run.
+    if (wantsAir(api))
     {
-        shader.air = AirCompiler::compile(recompiler.out);
-    }
-    catch (const std::exception& error)
-    {
-        result.errors.emplace_back(fmt::format("Failed to compile the recompiled shader to AIR:\n{}", indentLines(error.what())));
-        result.hlsl = std::move(recompiler.out);
-        printProgress(progress, numShaders);
-        return;
-    }
+        try
+        {
+            shader.air = AirCompiler::compile(recompiler.out);
+        }
+        catch (const std::exception& error)
+        {
+            result.errors.emplace_back(fmt::format("Failed to compile the recompiled shader to AIR:\n{}", indentLines(error.what())));
+            result.hlsl = std::move(recompiler.out);
+            printProgress(progress, numShaders);
+            return;
+        }
 
-    if (shader.air.empty())
-        result.warnings.emplace_back("The generated Metal AIR blob is empty.");
+        if (shader.air.empty())
+            result.warnings.emplace_back("The generated Metal AIR blob is empty.");
+    }
 #endif
 
-    DxcCompileResult spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true,
-        job.displayName(recompiler.isPixelShader) + " [SPIR-V]");
-
-    if (!spirv.succeeded())
+#ifdef XENOS_RECOMP_SPIRV
+    if (wantsVulkan(api))
     {
-        result.errors.emplace_back(fmt::format("Failed to compile the recompiled shader to SPIR-V:\n{}", indentLines(spirv.errors)));
-        result.hlsl = std::move(recompiler.out);
-        printProgress(progress, numShaders);
-        return;
-    }
+        if (!dxcCompiler.isValid())
+        {
+            result.errors.emplace_back("The DirectX Shader Compiler is not available, so the shader could not be compiled.");
+            result.hlsl = std::move(recompiler.out);
+            printProgress(progress, numShaders);
+            return;
+        }
 
-    if (!smolv::Encode(spirv.object->GetBufferPointer(), spirv.object->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo))
-    {
-        result.errors.emplace_back("Failed to encode the compiled SPIR-V.");
-        result.hlsl = std::move(recompiler.out);
-    }
+        DxcCompileResult spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true,
+            job.displayName(recompiler.isPixelShader) + " [SPIR-V]");
 
-    spirv.object->Release();
+        if (!spirv.succeeded())
+        {
+            result.errors.emplace_back(fmt::format("Failed to compile the recompiled shader to SPIR-V:\n{}", indentLines(spirv.errors)));
+            result.hlsl = std::move(recompiler.out);
+            printProgress(progress, numShaders);
+            return;
+        }
+
+        if (!smolv::Encode(spirv.object->GetBufferPointer(), spirv.object->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo))
+        {
+            result.errors.emplace_back("Failed to encode the compiled SPIR-V.");
+            result.hlsl = std::move(recompiler.out);
+        }
+
+        spirv.object->Release();
+    }
+#endif
 
     printProgress(progress, numShaders);
 }
@@ -625,6 +738,7 @@ static void writeReport(const Options& options, const std::vector<ShaderJob>& jo
     report.println("  \"failedShaders\": {},", failedShaders);
     report.println("  \"shadersWithWarnings\": {},", shadersWithWarnings);
     report.println("  \"decompressedArchives\": {},", decompressedArchives);
+    report.println("  \"graphicsApi\": \"{}\",", graphicsApiName(options.api));
 
     report.print("  \"warnings\": [");
     for (size_t i = 0; i < runWarnings.size(); i++)
@@ -1015,7 +1129,8 @@ static int recompileShaderCache(const Options& options, const std::string_view i
             if (index >= jobs.size())
                 return;
 
-            recompileShader(jobs[index], results[index], *shaderStorages[index], include, progress, uint32_t(jobs.size()));
+            recompileShader(jobs[index], results[index], *shaderStorages[index], include, options.api, progress,
+                uint32_t(jobs.size()));
         }
     };
 
@@ -1086,15 +1201,18 @@ static int recompileShaderCache(const Options& options, const std::string_view i
         }
     }
 
-    logLine("Creating shader cache...");
+    logLine("Creating the shader cache for the {} graphics API...", graphicsApiName(options.api));
 
     StringBuffer f;
     f.println("#include \"shader_cache.h\"");
+    f.println("");
+    f.println("// Generated by XenosRecomp for the {} graphics API.", graphicsApiName(options.api));
+    f.println("");
     f.println("ShaderCacheEntry g_shaderCacheEntries[] = {{");
 
-    std::vector<uint8_t> dxil;
-    std::vector<uint8_t> spirv;
-    std::vector<uint8_t> air;
+    std::vector<uint8_t> dxilData;
+    std::vector<uint8_t> spirvData;
+    std::vector<uint8_t> airData;
 
     for (size_t i = 0; i < jobs.size(); i++)
     {
@@ -1110,31 +1228,34 @@ static int recompileShaderCache(const Options& options, const std::string_view i
             std::replace(filename.begin(), filename.end(), '\\', '/');
         }
         f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, \"{}\" }},",
-            hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0,
-            spirv.size(), shader.spirv.size(), air.size(), shader.air.size(), shader.specConstantsMask, filename);
+            hash, dxilData.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0,
+            spirvData.size(), shader.spirv.size(), airData.size(), shader.air.size(), shader.specConstantsMask, filename);
 
+    #ifdef XENOS_RECOMP_DXIL
         if (shader.dxil != nullptr)
         {
-            dxil.insert(dxil.end(), reinterpret_cast<uint8_t *>(shader.dxil->GetBufferPointer()),
+            dxilData.insert(dxilData.end(), reinterpret_cast<uint8_t *>(shader.dxil->GetBufferPointer()),
                 reinterpret_cast<uint8_t *>(shader.dxil->GetBufferPointer()) + shader.dxil->GetBufferSize());
         }
-
-    #ifdef XENOS_RECOMP_AIR
-        air.insert(air.end(), shader.air.begin(), shader.air.end());
     #endif
 
-        spirv.insert(spirv.end(), shader.spirv.begin(), shader.spirv.end());
+    #ifdef XENOS_RECOMP_AIR
+        airData.insert(airData.end(), shader.air.begin(), shader.air.end());
+    #endif
+
+        spirvData.insert(spirvData.end(), shader.spirv.begin(), shader.spirv.end());
     }
 
     f.println("}};");
 
-    logLine("Compressing DXIL cache...");
-
     int level = ZSTD_maxCLevel();
 
 #ifdef XENOS_RECOMP_DXIL
-    std::vector<uint8_t> dxilCompressed(ZSTD_compressBound(dxil.size()));
-    dxilCompressed.resize(ZSTD_compress(dxilCompressed.data(), dxilCompressed.size(), dxil.data(), dxil.size(), level));
+    if (!dxilData.empty() || wantsDirect3D12(options.api))
+        logLine("Compressing DXIL cache...");
+
+    std::vector<uint8_t> dxilCompressed(ZSTD_compressBound(dxilData.size()));
+    dxilCompressed.resize(ZSTD_compress(dxilCompressed.data(), dxilCompressed.size(), dxilData.data(), dxilData.size(), level));
 
     f.print("const uint8_t g_compressedDxilCache[] = {{");
 
@@ -1143,14 +1264,14 @@ static int recompileShaderCache(const Options& options, const std::string_view i
 
     f.println("}};");
     f.println("const size_t g_dxilCacheCompressedSize = {};", dxilCompressed.size());
-    f.println("const size_t g_dxilCacheDecompressedSize = {};", dxil.size());
+    f.println("const size_t g_dxilCacheDecompressedSize = {};", dxilData.size());
 #endif
 
 #ifdef XENOS_RECOMP_AIR
     logLine("Compressing AIR cache...");
 
-    std::vector<uint8_t> airCompressed(ZSTD_compressBound(air.size()));
-    airCompressed.resize(ZSTD_compress(airCompressed.data(), airCompressed.size(), air.data(), air.size(), level));
+    std::vector<uint8_t> airCompressed(ZSTD_compressBound(airData.size()));
+    airCompressed.resize(ZSTD_compress(airCompressed.data(), airCompressed.size(), airData.data(), airData.size(), level));
 
     f.print("const uint8_t g_compressedAirCache[] = {{");
 
@@ -1159,13 +1280,14 @@ static int recompileShaderCache(const Options& options, const std::string_view i
 
     f.println("}};");
     f.println("const size_t g_airCacheCompressedSize = {};", airCompressed.size());
-    f.println("const size_t g_airCacheDecompressedSize = {};", air.size());
+    f.println("const size_t g_airCacheDecompressedSize = {};", airData.size());
 #endif
 
+#ifdef XENOS_RECOMP_SPIRV
     logLine("Compressing SPIRV cache...");
 
-    std::vector<uint8_t> spirvCompressed(ZSTD_compressBound(spirv.size()));
-    spirvCompressed.resize(ZSTD_compress(spirvCompressed.data(), spirvCompressed.size(), spirv.data(), spirv.size(), level));
+    std::vector<uint8_t> spirvCompressed(ZSTD_compressBound(spirvData.size()));
+    spirvCompressed.resize(ZSTD_compress(spirvCompressed.data(), spirvCompressed.size(), spirvData.data(), spirvData.size(), level));
 
     f.print("const uint8_t g_compressedSpirvCache[] = {{");
 
@@ -1175,7 +1297,9 @@ static int recompileShaderCache(const Options& options, const std::string_view i
     f.println("}};");
 
     f.println("const size_t g_spirvCacheCompressedSize = {};", spirvCompressed.size());
-    f.println("const size_t g_spirvCacheDecompressedSize = {};", spirv.size());
+    f.println("const size_t g_spirvCacheDecompressedSize = {};", spirvData.size());
+#endif
+
     f.println("const size_t g_shaderCacheEntryCount = {};", shaders.size());
 
     writeAllBytes(options.output.c_str(), f.out.data(), f.out.size());

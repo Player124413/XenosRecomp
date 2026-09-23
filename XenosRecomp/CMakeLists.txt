@@ -10,6 +10,11 @@ endif()
 
 option(XENOS_RECOMP_DXIL "Generate DXIL shader cache" ${XENOS_RECOMP_DXIL_DEFAULT})
 
+# Vulkan shader caches are generated on every platform, because the DirectX Shader Compiler ships
+# its SPIR-V backend for Windows, Linux and macOS. Turning this off skips the SPIR-V compilation
+# and removes the data from the generated shader cache, which halves its size for D3D12 games.
+option(XENOS_RECOMP_SPIRV "Generate a SPIR-V shader cache (Vulkan)" ON)
+
 if (APPLE)
     option(XENOS_RECOMP_AIR "Generate Metal AIR shader cache" ON)
 endif()
@@ -85,6 +90,10 @@ if (XENOS_RECOMP_DXIL)
         message(WARNING "DXIL support was enabled, but the DXIL validation library is not available on this "
             "platform. The generated DXIL will not be signed and may be rejected by the driver.")
     endif()
+endif()
+
+if (XENOS_RECOMP_SPIRV)
+    target_compile_definitions(XenosRecomp PRIVATE XENOS_RECOMP_SPIRV)
 endif()
 
 if (XENOS_RECOMP_AIR)

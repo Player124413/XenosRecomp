@@ -2,7 +2,8 @@ name: Build
 
 # Builds the recompiler on every platform and runs the self-test suite, which
 # recompiles generated shaders and checks the output, including the handling of
-# boolean constant registers such as b128/b129/b130.
+# boolean constant registers such as b128/b129/b130 and the shader caches that are
+# generated for a single graphics API.
 
 on:
   push:
@@ -15,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.os }}${{ matrix.dxil == 'OFF' && ', Vulkan only' || '' }})
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -24,10 +25,18 @@ jobs:
         include:
           - os: windows-latest
             preset: "Visual Studio 17 2022"
+            dxil: "ON"
           - os: ubuntu-latest
             preset: ""
+            dxil: "ON"
           - os: macos-latest
             preset: ""
+            dxil: "ON"
+          # Shader caches for Vulkan do not need DXIL at all, which is what a Vulkan only
+          # port builds.
+          - os: ubuntu-latest
+            preset: ""
+            dxil: "OFF"
 
     env:
       PYTHON: ${{ matrix.os == 'windows-latest' && 'python' || 'python3' }}
@@ -43,10 +52,10 @@ jobs:
         run: |
           set -e
 
-          # DXIL is enabled everywhere so that the DXIL code path is compiled and tested on
-          # every platform. Only Windows builds load the validation library, which is what
-          # signs the shaders for the driver.
-          CMAKE_ARGS="-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$GITHUB_WORKSPACE/bin -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DXENOS_RECOMP_DXIL=ON"
+          # Only Windows builds load the validation library, which is what signs the shaders
+          # for the driver, but the DXIL code path itself is compiled on every platform.
+          CMAKE_ARGS="-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$GITHUB_WORKSPACE/bin -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+          CMAKE_ARGS="$CMAKE_ARGS -DXENOS_RECOMP_DXIL=${{ matrix.dxil }} -DXENOS_RECOMP_SPIRV=ON"
 
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cmake -B build -G "${{ matrix.preset }}" -A x64 $CMAKE_ARGS
