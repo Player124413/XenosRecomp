@@ -1341,13 +1341,37 @@ static int recompileShaderCache(const Options& options, const std::string_view i
     return 0;
 }
 
+#ifdef _WIN32
+// The C runtime of Windows hands invalid arguments to functions such as setvbuf to the invalid
+// parameter handler, and the default handler ends the whole process with a fail fast code that
+// says nothing about what was wrong. This handler reports the argument instead.
+static void invalidParameterHandler(const wchar_t* expression, const wchar_t* function, const wchar_t* file,
+    unsigned int line, uintptr_t)
+{
+    fwprintf(stderr, L"Invalid parameter passed to %ls (%ls:%u)\n", function != nullptr ? function : L"a function",
+        file != nullptr ? file : L"a source file", line);
+    fflush(stderr);
+    exit(3);
+}
+#endif
+
 int main(int argc, char** argv)
 {
     g_startTime = std::chrono::steady_clock::now();
 
-    // Line buffer stdout so that messages printed by the worker threads appear in the
-    // logs in the same order as everything printed on stderr.
+#ifdef _WIN32
+    _set_invalid_parameter_handler(invalidParameterHandler);
+#endif
+
+    // Line buffer stdout so that messages printed by the worker threads appear in the logs in the
+    // same order as everything printed on stderr. MSVC does not accept _IOLBF and refuses to
+    // buffer the stream at all when it is passed to setvbuf, so on Windows stdout is left
+    // unbuffered, which keeps the order between the two streams as well.
+#ifdef _WIN32
+    setvbuf(stdout, nullptr, _IONBF, 0);
+#else
     setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
 
     Options options;
     if (!parseArgs(argc, argv, options))
